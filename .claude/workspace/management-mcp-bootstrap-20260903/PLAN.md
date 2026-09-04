@@ -144,6 +144,12 @@ flowchart TD
 
 ### 미충족·이관 항목 (은폐 금지)
 
-- [ ] **`AC-007-2` 컨테이너 기동 후 헬스 200 — 로컬 미검증.** Docker 미설치(FRD §7)로 `docker build`/`docker run`을 실행하지 못했다. `.github/workflows/ci.yml`의 `docker` 잡이 이 검증을 수행하도록 작성했고 정적 검증(YAML 파싱·`actionlint`·`shellcheck` 0 findings·액션 버전 4종 실존 확인)까지 마쳤으나 **실제 통과는 push 후에만 확인 가능**하다. 완화 근거: 컨테이너가 실행하는 것과 **동일한 진입점·동일한 env 8개**로 `uv run` 기동 + `/healthz` 200을 실측했다.
-- [ ] **`AC-007-3` CI 파이프라인 실동작 — push 전까지 미검증.** 위와 동일한 이유. 이번 워크플로는 커밋·푸시를 하지 않았다.
+- [x] **`AC-007-2` 컨테이너 기동 후 헬스 200 — CI에서 검증 완료.** push 트리거 CI([run 33825984027](https://github.com/ridsync/devoks-mcp-servers/actions/runs/33825984027))의 `Docker build (arm64) + /healthz smoke` 잡이 **success**. 로그 원문:
+  ```
+  GET /healthz -> 200 on attempt 3
+  --- /healthz response body ---
+  {"name":"devoks-management-mcp","version":"0.1.0"}
+  ```
+  `platform: linux/arm64`, 러너 `ubuntu-24.04-arm`(네이티브, QEMU 없음). 로컬 Docker 미설치 제약은 그대로지만 **검증 자체는 닫혔다.**
+- [x] **`AC-007-3` CI 파이프라인 실동작 — 검증 완료.** 같은 run의 `Lint · type check · test` 잡도 success: `ruff check` → `All checks passed!` / `pyright` → `0 errors, 0 warnings, 0 informations` / `pytest` → `282 passed in 6.95s`. 두 잡 모두 통과해야 워크플로가 성공하며 `continue-on-error`는 없다.
 - [ ] **실 GitHub 대상 라이브 호출 미검증** — GitHub App(`RES-API-005`) 미생성(조직 관리자 작업). 전 경로가 `httpx2.MockTransport`로 검증됐고 JWT 클레임·헤더·엔드포인트·1MB/100MB 경계·rate limit 응답 형태는 **공식 문서와 대조**했으나, 실 자격증명으로 붙는 확인은 Stage 2 항목이다(FRD §10).
