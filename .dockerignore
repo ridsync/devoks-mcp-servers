@@ -1,0 +1,50 @@
+# Docker build context for this workspace is the REPOSITORY ROOT (not
+# servers/management/), because servers/management/Dockerfile needs the
+# workspace-root uv.lock (see that file's own top-of-file comment for why).
+# Docker resolves `.dockerignore` relative to the build context root, so
+# this file lives here rather than next to the Dockerfile.
+
+# Secrets — never let a stray local .env reach the image (AC-007-4).
+.env
+**/.env
+
+# Local virtual environments — rebuilt inside the image by `uv sync`, and
+# copying a host-built one in (macOS arm64 Mach-O binaries, wrong Python
+# ABI) would corrupt the Linux venv the Dockerfile itself builds.
+.venv/
+**/.venv/
+
+# Version control / workspace tooling docs — not part of the runtime
+# artifact, and .claude/ in particular is this repo's FRD/PLAN workflow
+# scratch space, not application config.
+.git/
+.claude/
+
+# Python bytecode / cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Test suite — not needed at runtime; TASK-031's CI runs tests from source
+# (via `uv run pytest`) before the image build, not from inside the image.
+**/tests/
+
+# Lint / type-check / test caches
+.ruff_cache/
+**/.ruff_cache/
+.pytest_cache/
+**/.pytest_cache/
+.pyright/
+**/.pyright/
+
+# Build artifacts (matches .gitignore) — irrelevant to `uv sync`, which
+# rebuilds the wheel it needs from source inside the image.
+dist/
+**/dist/
+build/
+**/build/
+*.egg-info/
+**/*.egg-info/
+
+# Editor/OS noise
+.DS_Store

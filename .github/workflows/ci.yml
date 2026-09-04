@@ -1,0 +1,247 @@
+name: CI
+
+# TASK-031 / REQ-007: lint + type-check + test + image build, plus a real
+# container-startup smoke test against /healthz. Any single failure below
+# fails the whole run (AC-007-3) — no step here uses `continue-on-error`.
+#
+# Runs on push to *every* branch (not just `main`) and on every pull_request,
+# so pushes to a feature branch (e.g. `feat/1-management-mcp-bootstrap`) are
+# covered too — narrowing `push.branches` to `main` would mean this pipeline
+# never runs until the PR merges, which defeats its purpose as a pre-merge
+# gate.
+on:
+  push:
+  pull_request:
+
+# Cancel a superseded run for the same ref (e.g. a rapid follow-up push)
+# instead of letting it finish — saves runner minutes without weakening the
+# gate (the newer commit's own run still has to pass).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# This workflow never pushes an image to a registry (that's Stage 2 / ECR,
+# FRD §10) and never writes to the repository — read-only is sufficient for
+# checkout + local `docker build`/`docker run`.
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Quality gate: ruff (lint + format check), pyright, pytest.
+  # Runs on the standard x64 runner — none of these steps touch the
+  # container image or its target architecture, so there is no reason to pay
+  # for (or wait on) an arm64 runner here.
+  # -------------------------------------------------------------------------
+  quality:
+    name: Lint · type check · test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7 # https://github.com/actions/checkout/releases — latest major v7, verified via GitHub API before pinning
+
+      # Python version: deliberately NOT actions/setup-python. This project's
+      # `.python-version` pins 3.14, and Python 3.14 is a hard floor here —
+      # not just a preference (see servers/management/Dockerfile's own
+      # "WHY python:3.14 SPECIFICALLY" note): client.py uses PEP 758
+      # (parenthesis-free multi-exception `except`), a SyntaxError on 3.13.
+      # astral-sh/setup-uv lets uv itself download and manage the exact
+      # interpreter `.python-version` names (uv's default
+      # UV_PYTHON_DOWNLOADS=automatic, unlike the Dockerfile which disables
+      # it to reuse the base image's own interpreter) — one fewer moving
+      # part than keeping a second tool's version pin in sync with
+      # `.python-version`/`requires-python`.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1 # https://github.com/astral-sh/setup-uv/releases — no floating "v10" major tag exists (checked via GitHub API), so pinned to the exact latest release
+        with:
+          version: "0.11.4" # matches the uv version pinned in servers/management/Dockerfile (COPY --from=ghcr.io/astral-sh/uv:0.11.4), so CI and the image resolve/sync with the identical uv release
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+        # No formatter is run for this workflow file itself: `ruff format`
+        # only targets Python (config.py's [tool.ruff] src = the Python
+        # source/test dirs). YAML has no project formatter configured — the
+        # PLAN task report notes this explicitly rather than silently
+        # skipping it.
+
+      - name: pyright
+        run: uv run pyright
+
+      - name: pytest
+        run: uv run pytest -q
+
+  # -------------------------------------------------------------------------
+  # Image build (CTR-010 = linux/arm64) + container-startup smoke test
+  # (AC-007-2). Runs independently of `quality` (no `needs:`) rather than
+  # after it — this repository is public, so GitHub-hosted runner minutes
+  # (including arm64) are free and unlimited, so there is no runner-usage
+  # reason to serialize; running both jobs in parallel instead gives faster
+  # end-to-end feedback on push, which matters more here (a human is waiting
+  # on the result). Both jobs must still pass for the overall run to be
+  # green — GitHub Actions already fails the run if any job fails, which is
+  # what AC-007-3 requires.
+  #
+  # ARCHITECTURE DECISION (the trap flagged in the handover notes):
+  # CTR-010 targets linux/arm64 (Fargate Graviton), but GitHub's *default*
+  # hosted runner (ubuntu-latest) is amd64 — building arm64 there would need
+  # QEMU emulation (docker/setup-qemu-action) for both the build and, worse,
+  # for actually *running* the built image to curl /healthz, which is slow
+  # and occasionally flaky under emulation.
+  # Resolution: this job runs on `ubuntu-24.04-arm`, a *native* arm64
+  # GitHub-hosted runner. Verified before choosing it (not assumed):
+  #   1. This repository is public (`gh repo view` → "visibility": "PUBLIC"),
+  #      and GitHub's docs (github/docs, actions/reference/runners) list
+  #      standard arm64 Linux runners (`ubuntu-24.04-arm`, `ubuntu-22.04-arm`)
+  #      as free and unlimited for public repositories, same as the x64
+  #      standard runners — not a paid/limited tier.
+  #   2. `ubuntu-24.04-arm`'s own image manifest (actions/runner-images,
+  #      Ubuntu2404-Arm64-Readme.md) ships Docker Server/Client 28.0.4 and
+  #      Docker-Buildx 0.36.1 preinstalled — no extra runner bootstrapping
+  #      needed beyond docker/setup-buildx-action for the BuildKit features
+  #      (`--mount=type=cache`, `--mount=type=bind`) the Dockerfile's first
+  #      line (`# syntax=docker/dockerfile:1`) requires.
+  # This is option (a) from the handover notes: no QEMU anywhere in this
+  # job — the build is native and the smoke-tested container runs natively,
+  # so the smoke test's timing/behavior is representative of the real
+  # Fargate target instead of emulated.
+  docker:
+    name: Docker build (arm64) + /healthz smoke
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4 # https://github.com/docker/setup-buildx-action/releases — latest major v4, verified via GitHub API. Required for the Dockerfile's --mount=type=cache/--mount=type=bind BuildKit features (handover note).
+
+      # Build context MUST be the repository root (uv.lock lives there, not
+      # under servers/management/) — see servers/management/Dockerfile's own
+      # top-of-file comment and the handover notes for TASK-031.
+      # `platforms: linux/arm64` is technically redundant on a native arm64
+      # runner (no cross-compilation is happening either way) but is kept
+      # explicit so the build's intent matches CTR-010 in the workflow
+      # source, not just implicitly via runner choice.
+      # `load: true` pulls the built image into this runner's local Docker
+      # daemon so the smoke-test step below can `docker run` it directly —
+      # without it the image would only exist inside buildx's own builder
+      # and `docker run` could not see it.
+      - name: Build image
+        uses: docker/build-push-action@v7 # https://github.com/docker/build-push-action/releases — latest major v7, verified via GitHub API
+        with:
+          context: .
+          file: servers/management/Dockerfile
+          platforms: linux/arm64
+          push: false
+          load: true
+          tags: devoks-mcp-management:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # AC-007-2 requires the container to be started with CTR-006's
+      # required env vars and to answer /healthz with 200 — this step does
+      # both, then polls with a timeout instead of assuming instant
+      # readiness, and dumps container logs before failing so a startup
+      # failure is diagnosable from the Actions log alone (no re-run needed
+      # just to see why).
+      - name: Start container and smoke-test /healthz
+        run: |
+          set -euo pipefail
+
+          # GITHUB_APP_PRIVATE_KEY must be a PEM that actually parses
+          # (config.py's Fail-Fast startup validation calls
+          # cryptography's load_pem_private_key on it) — generating one here
+          # with openssl needs no secret at all; this key never talks to
+          # GitHub (lifespan token issuance is lazy — verified in TASK-023 —
+          # so a container smoke test that only hits /healthz makes zero
+          # GitHub API calls with it).
+          openssl genrsa -out /tmp/ci-smoke-key.pem 2048
+
+          # CTR-006's 8 required env vars (config.py's _REQUIRED_KEYS) —
+          # create_app_from_env fails startup immediately if any is missing,
+          # so all 8 must be present for /healthz to ever answer.
+          # Values verified locally (uv run uvicorn + curl) before writing
+          # this step, exactly as CI will run them:
+          #   - MCP_PUBLIC_URL must end in "/mcp" with no trailing slash
+          #     (config.py's _parse_public_url, CTR-001 well-known path
+          #     derivation).
+          #   - MCP_ALLOWED_HOSTS: /healthz itself is NOT gated by
+          #     transport_security (app.py mounts it on the outer Starlette
+          #     app, before Mount("/", mcp_app) — verified locally: curl
+          #     with an arbitrary Host header against a running instance
+          #     still returned 200). This value only matters for /mcp
+          #     requests, which this smoke test does not make; "localhost"
+          #     is supplied purely to satisfy the required-key check, and
+          #     app.py's _expand_allowed_hosts already expands a bare host
+          #     to both "localhost" and "localhost:*" forms.
+          export MCP_ALLOWED_HOSTS="localhost"
+          export MCP_PUBLIC_URL="https://ci.example.com/mcp"
+          export MCP_ISSUER_URL="https://ci.example.com"
+          export MCP_CLIENT_TOKENS='{"smoke-token":{"client_id":"ci-smoke","role":"reader","scopes":["devoks:read"]}}'
+          export MCP_ROLE_TOOLS='{"reader":["list_repos","get_repo_tree","read_file","search_code"]}'
+          export GITHUB_APP_ID="000000000"
+          GITHUB_APP_PRIVATE_KEY="$(cat /tmp/ci-smoke-key.pem)"
+          export GITHUB_APP_PRIVATE_KEY
+          export GITHUB_APP_INSTALLATION_ID="00000000"
+
+          # `-e VAR` (no "=value") passes the value through from this shell's
+          # own environment rather than being written inline as a `docker
+          # run` argument — needed for GITHUB_APP_PRIVATE_KEY, which is a
+          # multi-line PEM that would otherwise have to survive shell word
+          # splitting/argument quoting.
+          docker run -d --name mcp-smoke -p 8000:8000 \
+            -e MCP_ALLOWED_HOSTS \
+            -e MCP_PUBLIC_URL \
+            -e MCP_ISSUER_URL \
+            -e MCP_CLIENT_TOKENS \
+            -e MCP_ROLE_TOOLS \
+            -e GITHUB_APP_ID \
+            -e GITHUB_APP_PRIVATE_KEY \
+            -e GITHUB_APP_INSTALLATION_ID \
+            devoks-mcp-management:ci
+
+          status=""
+          for attempt in $(seq 1 30); do
+            if status=$(curl -s -o /tmp/healthz-body.json -w '%{http_code}' http://localhost:8000/healthz); then
+              if [ "$status" = "200" ]; then
+                echo "GET /healthz -> 200 on attempt ${attempt}"
+                break
+              fi
+            fi
+            if [ "$attempt" = "30" ]; then
+              echo "::error::container did not answer GET /healthz with 200 within 30s (last status: ${status:-<connection failed>})"
+              echo "--- docker logs mcp-smoke ---"
+              docker logs mcp-smoke || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "--- /healthz response body ---"
+          cat /tmp/healthz-body.json
+          echo
+
+          # AC-001-3 / this task's own smoke requirement: the body must
+          # carry the server name and version, not just an empty 200.
+          if ! grep -q '"name"' /tmp/healthz-body.json || ! grep -q '"version"' /tmp/healthz-body.json; then
+            echo "::error::/healthz responded 200 but body is missing 'name' or 'version'"
+            docker logs mcp-smoke || true
+            exit 1
+          fi
+
+      - name: Dump container logs (failure diagnostics)
+        if: failure()
+        run: docker logs mcp-smoke || true
+
+      - name: Stop and remove container
+        if: always()
+        run: docker rm -f mcp-smoke || true
