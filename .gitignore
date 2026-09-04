@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Test / lint / type-check caches
+.pytest_cache/
+.ruff_cache/
+.pyright/
+
+# Secrets (see .env.example for the tracked template)
+.env

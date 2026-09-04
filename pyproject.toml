@@ -1,0 +1,32 @@
+[tool.uv.workspace]
+members = ["servers/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+src = ["servers/management/src", "servers/management/tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pyright]
+include = ["servers/management/src", "servers/management/tests"]
+pythonVersion = "3.14"
+typeCheckingMode = "strict"
+venvPath = "."
+venv = ".venv"
+
+# Workspace-wide, like the ruff and pyright config above it. This lives at the
+# root rather than in servers/management/ because pytest resolves its config by
+# walking up from the invocation's arguments: with the config only in the member
+# package, a bare `uv run pytest` from the repo root found no `asyncio_mode` and
+# reported 129 failures out of 235 — every async test erroring on a missing
+# event loop. The suite was fine; only the invocation was. The obvious command
+# has to be the correct one, so the setting belongs where the root-level run can
+# see it.
+[tool.pytest.ini_options]
+testpaths = ["servers/management/tests"]
+asyncio_mode = "auto"
