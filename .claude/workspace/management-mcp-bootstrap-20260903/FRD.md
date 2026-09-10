@@ -13,7 +13,8 @@ issue: https://github.com/ridsync/devoks-mcp-servers/issues/1
 
 > 사내 프로젝트/서비스의 지식·상태를 여러 에이전트 클라이언트에서 단일 진입점으로 조회하는
 > Management MCP 서버의 **Stage 1(서버 골격 + GitHub 조회 + 컨테이너화/CI)** 요구서.
-> Stage 2(ECS/Fargate 실배포)·Stage 3(Slackbot 연동)은 §10 로드맵에 후속 작업으로 기록한다.
+> Stage 2(AWS Lambda 실배포)·Stage 3(Slackbot 연동)은 §10 로드맵에 후속 작업으로 기록한다.
+> **배포 타깃은 2026-09-10에 ECS/Fargate → Lambda + Function URL로 변경 확정**됐다(비용 실측 근거 §10).
 
 ## 1. Goal
 
@@ -117,7 +118,7 @@ Claude Code·Codex 등 각 AgentClient와 Slack·Notion·Discord 환경이 **하
 
 - **동작:** Stage 2·3의 남은 작업을 문서로 남겨 다음 세션이 근거를 재수집하지 않게 한다.
 - **AC:**
-  - `AC-008-1` THE SYSTEM SHALL Stage 2(ECS/Fargate 배포)와 Stage 3(Slackbot 연동)의 남은 작업·미결 결정 사항을 §10 로드맵에 기록한다.
+  - `AC-008-1` THE SYSTEM SHALL Stage 2(실배포)와 Stage 3(Slackbot 연동)의 남은 작업·미결 결정 사항을 §10 로드맵에 기록한다.
   - `AC-008-2` THE SYSTEM SHALL 저장소 루트에 서버 실행 방법·필수 환경변수·MCP 클라이언트 등록 방법을 담은 README를 제공한다.
 
 ## 4. Design Spec
@@ -127,7 +128,7 @@ Claude Code·Codex 등 각 AgentClient와 Slack·Notion·Discord 환경이 **하
 ### 4.1 데이터 흐름 (UI 없음)
 
 ```
-AgentClient ──HTTPS──▶ [ALB/로컬] ──▶ Starlette app
+AgentClient ──HTTPS──▶ [Lambda Function URL / 로컬] ──▶ Starlette app
                                         ├─ GET  /healthz              → 200 {name, version}
                                         ├─ GET  /.well-known/oauth-protected-resource/mcp  (SDK 자동)
                                         └─ Mount /mcp → MCPServer
@@ -218,7 +219,8 @@ devoks-mcp-servers/                      # uv workspace 루트 (모노레포)
 | CTR-004 | `read_file` 응답 상한 | bytes, 1..1048576 | 262144 (256 KiB) | 초과 시 절단 + 전체 크기 통지 |
 | CTR-005 | `search_code` 최대 결과 수 | int, 1..100 | 30 | 모델 컨텍스트 보호 |
 | CTR-009 | installation 토큰 갱신 여유 | seconds, 60..1800 | 300 | 잔여 수명이 이 값 이하면 재발급 |
-| CTR-010 | 이미지 타깃 아키텍처 | `linux/arm64` \| `linux/amd64` | `linux/arm64` | Fargate ARM64(Graviton). 로컬 개발기(Apple Silicon)와 일치해 크로스빌드가 불필요하다 |
+| CTR-010 | 이미지 타깃 아키텍처 | `linux/arm64` \| `linux/amd64` | `linux/arm64` | Lambda `arm64`(Graviton). 로컬 개발기(Apple Silicon)와 일치해 크로스빌드가 불필요하다. Lambda arm64 요율이 x86 대비 20% 저렴하다(실측: `$0.0000133334` vs `$0.0000166667` /GB-초, 서울) |
+| CTR-011 | Lambda 패키징 계약 | 고정값 | — | 단일 이미지가 Lambda·컨테이너 런타임 양쪽에서 동작해야 한다. ① LWA 확장을 `/opt/extensions/lambda-adapter`에 배치 ② `AWS_LWA_PORT` = `MCP_PORT` ③ `AWS_LWA_READINESS_CHECK_PATH` = `/healthz`(`CTR-001`) ④ `AWS_LWA_INVOKE_MODE` = `BUFFERED`(`MCP_JSON_RESPONSE=true`이므로 스트리밍 불필요). LWA 확장은 **Lambda 런타임에서만 기동**되므로 로컬 `docker run`·Fargate에는 무영향 |
 
 ### 5.2 환경 키
 
@@ -238,6 +240,8 @@ devoks-mcp-servers/                      # uv workspace 루트 (모노레포)
 | | `MCP_READ_FILE_MAX_BYTES` | int | `CTR-004` 기본값 | `CTR-004` 오버라이드. 범위 밖이면 기동 실패 |
 | | `MCP_SEARCH_CODE_MAX_RESULTS` | int | `CTR-005` 기본값 | `CTR-005` 오버라이드. 범위 밖이면 기동 실패 |
 | | `MCP_TOKEN_REFRESH_LEEWAY_SECONDS` | int | `CTR-009` 기본값 | `CTR-009` 오버라이드. 범위 밖이면 기동 실패 |
+| | `MCP_STATELESS_HTTP` | bool | `true` | `streamable_http_app(stateless_http=)`. Lambda 배포의 **필수 조건**(§7 배포 타깃 제약). `false`로 두면 legacy 레그가 `Mcp-Session-Id`를 발급하는데 Lambda는 인스턴스가 임의로 교체되므로 세션이 유실된다 |
+| | `MCP_JSON_RESPONSE` | bool | `true` | `streamable_http_app(json_response=)`. `true`면 SSE 대신 단일 JSON 응답 → Lambda 버퍼드 호출과 정합. `false`면 `AWS_LWA_INVOKE_MODE=RESPONSE_STREAM`이 함께 필요해진다(`CTR-011`) |
 
 > **⚠️ `MCP_PUBLIC_URL`의 경로가 well-known 경로를 결정한다** (`TASK-009` 실측 발견). SDK가 `.well-known` 라우트를 이 URL의 **path 컴포넌트에서 파생**한다:
 >
@@ -329,6 +333,11 @@ devoks-mcp-servers/                      # uv workspace 루트 (모노레포)
     | `2025-11-25` 이하 | **발급 + 필수** (없으면 `Missing session ID`) | **sticky session** 또는 `stateless_http=True` |
 
     SDK가 `LATEST_PROTOCOL_VERSION = 2026-07-28`을 지원하지만, **SDK 자체 클라이언트의 기본 핸드셰이크는 `2025-11-25`로 협상**된다(실측). 즉 현실의 AgentClient가 legacy 레그로 붙을 가능성이 높다. `stateless_http`는 legacy 레그 전용 플래그이고 2026-07-28 경로에서는 코드가 그 줄에 도달하지 않지만, **"켜도 의미 없다"가 아니다** — legacy 레그에서는 그것이 sticky session의 대안이다. 대가는 서버→클라이언트 역채널(sampling, push elicitation, `roots/list`)과 재개 가능성 상실이며, Stage 1 툴은 모두 단발 조회라 그 대가가 없다. **Stage 2에서 결정해야 한다**(§10).
+  - **배포 타깃 제약 (Lambda + Function URL, 2026-09-10 확정 — §10 근거):**
+    - `session_manager.run()`은 **인스턴스당 1회만** 호출 가능하다(`RuntimeError` — SDK 소스 실측). 그 안에서 `create_server`에 준 MCP 프로토콜 lifespan(`_make_github_lifespan`)이 **컨테이너 수명당 1회** 진입하고 `_handle_stateless_request`가 쓰는 anyio task group이 생긴다. LWA는 uvicorn을 정상 부팅시키므로 컨테이너 1개 = `run()` 1회로 자연 충족되지만, **Lambda 핸들러에서 앱을 재생성하는 방식으로 바꾸면 즉시 깨진다.**
+    - `stateless=True`에서도 `run()`은 **여전히 필요하다** — 세션 딕셔너리만 안 쓰고 lifespan·task group은 그대로 쓴다(SDK 소스 실측). "stateless니까 lifespan 불필요"는 오독이다.
+    - Lambda 실행 환경은 호출 사이에 **동결**된다. 요청 처리가 응답 반환 전에 완결돼야 하므로 `json_response=True`가 필수다(SSE 장기 스트림은 동결과 충돌).
+    - **CloudFront + Function URL은 MCP와 비호환** — OAC로 Function URL을 보호하려면 `AuthType=AWS_IAM`이 필요하고, AWS 문서는 "`PUT`·`POST`를 쓰면 클라이언트가 본문 SHA256을 `x-amz-content-sha256` 헤더로 보내야 하며 **Lambda는 unsigned payload를 지원하지 않는다**"고 명시한다. MCP Streamable HTTP는 전부 POST이므로 모든 MCP 클라이언트가 SigV4 본문 서명을 해야 하는데 그런 클라이언트는 없다. 커스텀 도메인은 **API Gateway HTTP API**로 간다(§10 Step 7).
   - **`AuthSettings`의 URL은 plain `str`로 넘긴다** — `pydantic.AnyHttpUrl`로 먼저 감싸면 경로 없는 URL에 후행 슬래시가 붙는다(`https://mcp.example.com` → `https://mcp.example.com/`). `AuthSettings`의 `url_preserve_empty_path=True`는 pydantic이 **문자열을 검증할 때만** 적용되고, 이미 만들어진 `AnyHttpUrl` 인스턴스는 재검증 없이 통과하기 때문이다(실측). MCP 스펙도 후행 슬래시 **없는** 형태를 권장하므로, `AC-002-4`(RFC 9728 `resource` = 공개 URL 일치)를 지키려면 문자열 전달이 맞다. 대가로 pyright `reportArgumentType` ignore 2곳이 필요하다.
 
 ## 8. Edge Cases & Error Handling
@@ -341,7 +350,7 @@ devoks-mcp-servers/                      # uv workspace 루트 (모노레포)
 | EDGE-004 | 파일이 `CTR-004` 상한 초과 | 상한까지 절단 + 절단 사실·전체 크기 통지 (`AC-005-4`) |
 | EDGE-013 | **`path`·`ref` 인자에 경로 트래버설**(`../`, `.`, 백슬래시) — 보안 검증에서 **실제 재현된 Critical** | GitHub 호출 전에 거부한다. `repo`만 인가 판정을 받고 `path`는 검증되지 않아 `read_file(repo=<허용>, path="../../../victim/secret/contents/.env")`가 **allowlist를 완전히 우회**하고 `path="../../../../installation/repositories"`로 **4툴 표면 밖 임의 GitHub GET**에 도달했다. 감사에는 `outcome=ok`로 남아 사후 탐지도 어려웠다. **이중 방어**: ① 세그먼트 검증(`..`/`.`/백슬래시 거부) ② 정규화 후 URL이 `/repos/{owner}/{repo}/contents`로 시작하는지 assert (`AC-003-3`, `CTR-008`) |
 | EDGE-014 | **`search_code`의 `query`에 GitHub 검색 qualifier 주입**(`repo:`/`org:`/`user:`, boolean `OR`) — **High** | 쿼리를 거부하고, 방어적으로 **응답 항목도 allowlist로 재필터**한다. `query="password OR repo:victim/secret"`이 `q=... repo:victim/secret repo:<허용>`로 나가 GitHub 문서상 지원되는 다중 `repo:` OR 결합으로 경계를 우회한다. 응답의 `repository`를 파싱하고도 필터에 쓰지 않던 것이 2차 결함 (`AC-003-3`, `CTR-008`) |
-| EDGE-015 | **토큰 갱신에 병합된 호출자 중 하나가 취소됨** — **High** | 취소가 공유 태스크로 전파되지 않아야 한다. `await inflight`는 asyncio 표준 동작상 대기자의 취소를 공유 `Task`로 전파하므로, 한 요청의 정상적 취소(클라이언트 재시도·ALB 유휴 타임아웃)가 **무관한 동시 호출 전부를 실패**시킨다. `AC-006-5`의 "나머지 요청은 그 결과를 공유한다"가 깨진다 |
+| EDGE-015 | **토큰 갱신에 병합된 호출자 중 하나가 취소됨** — **High** | 취소가 공유 태스크로 전파되지 않아야 한다. `await inflight`는 asyncio 표준 동작상 대기자의 취소를 공유 `Task`로 전파하므로, 한 요청의 정상적 취소(클라이언트 재시도·프론팅 계층 타임아웃 — `EDGE-018`)가 **무관한 동시 호출 전부를 실패**시킨다. `AC-006-5`의 "나머지 요청은 그 결과를 공유한다"가 깨진다 |
 | EDGE-012 | 파일이 **1 MB 초과** (GitHub contents API가 기본 JSON에 내용을 싣지 않는 구간) | raw 미디어타입으로 받아 `CTR-004` 상한까지 절단해 반환 — `EDGE-004`와 같은 결과. 공식 문서: ≤1 MB는 전 기능 지원, **1–100 MB는 raw·object 미디어타입만**, >100 MB는 미지원. **>100 MB는 절단조차 불가**하므로 크기와 함께 조회 불가를 알린다 (`AC-005-4`, `TASK-025`) |
 | EDGE-005 | 파일이 바이너리(UTF-8 디코딩 실패) | 내용 대신 바이너리 표시 + 크기 (`AC-005-5`) |
 | EDGE-006 | 없는 저장소·ref·경로 | 무엇을 못 찾았는지 명시한 툴 오류. allowlist 밖 저장소는 존재 여부조차 알리지 않음 (`AC-005-8`, `AC-003-5`) |
@@ -350,6 +359,10 @@ devoks-mcp-servers/                      # uv workspace 루트 (모노레포)
 | EDGE-009 | 툴 본문이 예상 못한 예외로 실패 | 클라이언트에는 정규화된 툴 오류, 스택트레이스는 서버 로그만. 감사 레코드는 `error`로 남음 (`AC-004-4`, `AC-005-7`) |
 | EDGE-010 | 유효 토큰이지만 필수 스코프 부족 | **403** + `error="insufficient_scope"` — 미인증의 **401** `invalid_token`과 **다른 상태코드**다(SDK `bearer_auth.py` 실측). 툴 미실행 (`AC-002-5`) |
 | EDGE-011 | `Host`는 허용이나 `Origin`이 미허용(브라우저 경유) | 403. 서버 로그에 사유 기록 (`AC-001-4` 계열) |
+| EDGE-016 | **콜드스타트** — 유휴 후 첫 요청이 컨테이너 초기화를 유발 | 1~2초 지연을 **정상 동작으로 허용**한다. 단발 조회 툴이라 기능 영향이 없다. 제거가 필요하면 프로비저닝 동시성(월 $5.39 실측)이 있으나 Stage 2 기본값은 아니다. `session_manager.run()`이 인스턴스당 1회라는 제약(§7)과 맞물리므로 **재시도로 콜드스타트를 회피하려는 로직을 추가하면 안 된다** |
+| EDGE-017 | Lambda 동기 호출 **응답 페이로드 6 MB** 한계 초과 | 도달 불가 — `CTR-004` 상한이 1 MiB이고 SDK `max_request_body_size` 기본값이 4 MiB다. 단 `MCP_READ_FILE_MAX_BYTES`를 상한 밖으로 올릴 수 없게 이미 기동 검증이 막고 있다(`CTR-004` 범위 `1..1048576`). 이 경계는 **CTR-004 상한을 올리려는 향후 변경의 하드 제약**으로 기록한다 |
+| EDGE-018 | **API Gateway HTTP API 통합 타임아웃 30초(하드)** vs GitHub HTTP 타임아웃 30초 | 현재 `_GITHUB_HTTP_TIMEOUT_SECONDS = 30.0`이라 여유가 0이고, 느린 GitHub 응답이 API Gateway 504로 나가 툴 오류가 `EDGE-003`/`EDGE-009`의 정규화 경로를 타지 못한다. **GitHub 타임아웃을 20초로 낮춰** 서버가 먼저 타임아웃을 잡고 정규화된 툴 오류를 반환하게 한다. Function URL 직결(Step 5~6)에서는 15분 한계라 해당 없으나, Step 7 이후 상시 적용된다 |
+| EDGE-019 | **프론팅 계층이 `Host`를 치환** | `MCP_ALLOWED_HOSTS`(앱이 검증하는 값)와 `MCP_PUBLIC_URL`(클라이언트가 보는 값)이 갈라지면 전 요청 421이다. Function URL 직결은 둘 다 lambda-url 호스트로 일치한다. **CloudFront는 `AllViewerExceptHostHeader`가 필수여서 앱이 lambda-url 호스트를 보게 되어 강제로 갈라진다** — API Gateway HTTP API는 `Host`가 `mcp.devoks.kr`로 도착해 일치를 유지한다(§7 · §10 Step 7의 기술 선택 근거) |
 
 ## 9. Testing Strategy
 
@@ -366,21 +379,54 @@ devoks-mcp-servers/                      # uv workspace 루트 (모노레포)
 
 > `AC-008-1` 충족. 이번 워크플로 실행 범위는 **Stage 1**이며, 아래는 다음 세션이 이어받을 작업이다.
 
-### Stage 2 — AWS ECS/Fargate 실배포
+### Stage 2 — AWS Lambda 실배포 (배포 타깃 변경 확정: 2026-09-10)
 
-- [ ] ECR 리포지토리 생성, 이미지 push (`CTR-010` = `linux/arm64`)
-- [ ] Fargate 태스크 정의 — 헬스체크는 `CTR-001`의 `/healthz`, 아키텍처 ARM64
-- [ ] **legacy 레그 확장 방식 결정 (필수 결정, §7 실측 근거)** — 태스크를 2개 이상 띄우는 순간 `2025-11-25` 클라이언트는 sticky session이 없으면 `Missing session ID`로 깨진다. 선택지: **(a) ALB 대상그룹 stickiness 활성화** — 역채널·재개 가능성 유지, 대신 태스크 교체 시 세션 유실 / **(b) `stateless_http=True`** — 라우팅 자유, 역채널·재개 상실(Stage 1 툴은 단발 조회라 무해). Stage 1 툴 세트만 유지하는 동안은 (b)가 단순하고, Slackbot(Stage 3)이 elicitation을 쓰기 시작하면 재검토가 필요하다. **태스크 1개로 시작하면 이 결정을 미룰 수 있다.**
-- [ ] ALB + TLS 인증서 + 도메인 연결, ALB 뒤 `MCP_ALLOWED_HOSTS` 확정 주입
-- [ ] 시크릿을 Secrets Manager / SSM Parameter Store로 이전 (App private key, `MCP_CLIENT_TOKENS`)
-- [ ] 로그 드라이버 `awslogs` → CloudWatch Logs. 감사 레코드용 로그 그룹·보존기간·메트릭 필터
-- [ ] `MCP_REPO_ALLOWLIST` 프로덕션 값 확정
-- [ ] 실제 MCP 클라이언트(Claude Code)에서 원격 등록·툴 호출 E2E 검증
+> **배포 타깃이 ECS/Fargate → Lambda + Function URL로 바뀌었다.** 근거는 AWS Price List Query API로 실측한 서울 리전 요율이다. Fargate(0.25 vCPU / 0.5 GB, ARM) + ALB 구성은 **월 $38**인데, 그 중 **ALB 시간당 $16.43 + ALB가 2개 AZ에 강제로 갖는 공용 IPv4 2개 $7.30 = $23.73(62%)**가 "트래픽이 0이어도 24시간 대기하는 고정 진입점" 값이다. 실제 연산은 $8.29(22%)뿐이다.
+>
+> 이 서버는 **읽기 전용 4툴 · 요청 간 상태 없음 · 내부 팀 사용**이라 상시 대기가 필요 없다. Lambda 프리티어(월 100만 요청 + 400,000 GB-초, **상시 무료**) 안에서 동일 기능이 **월 $0.01**(ECR 저장분)로 제공된다 — 월 5,000회 호출 × 400 ms × 512 MB = 1,000 GB-초로 무료 한도의 0.25%다. 월 20만 회까지 무료 구간이다.
+>
+> **이 결정이 아래 "legacy 레그 확장 방식" 미결 사항을 (b)로 확정한다** — `stateless_http=True`. §7이 이미 기록한 대로 대가는 서버→클라이언트 역채널(sampling, push elicitation, `roots/list`)과 재개 가능성 상실이고, Stage 1의 단발 조회 툴에는 무해하다. **Stage 3(Slackbot이 elicitation을 쓰기 시작하는 시점)이 재검토 트리거**다.
+>
+> **Step 1 산출물은 전부 재사용된다** — Lambda는 ECR 컨테이너 이미지로 배포되므로 ECR 리포지토리·라이프사이클·GitHub OIDC 공급자·IAM 역할·CI 빌드·arm64 Dockerfile이 그대로 쓰인다. 태스크 정의·ALB·대상그룹은 **아직 만들지 않았으므로 폐기 비용이 0**이다.
+>
+> 검토했으나 탈락한 대안: **App Runner**(TLS·커스텀 도메인 내장으로 ALB가 불필요했으나 **ap-northeast-2 미제공** — Price List API로 제공 리전 확인: `ap-northeast-1, ap-south-1, ap-southeast-1/2, eu-*, us-*`), **Fargate + Cloudflare Tunnel**(월 $11.94, 콜드스타트 없음, 사이드카·외부 의존 추가).
+
+- [x] **Step 1 — 이미지 공급 경로** (계정 `703630528452`, `infra/01-ecr-and-github-oidc.sh`)
+  - ECR 리포지토리 `devoks-mcp-management` + scanOnPush + 라이프사이클 정책
+  - GitHub OIDC 공급자 — thumbprint를 인증서 체인에서 **실시간 계산**(GitHub이 Let's Encrypt로 이전해 유통되는 DigiCert 값 `6938fd4d…`는 폐기됨)
+  - IAM 역할 `devoks-mcp-github-actions` — **immutable subject claim** 신뢰 정책 `repo:ridsync@8566036/devoks-mcp-servers@1355671954:*` (2026-07-15 이후 생성 저장소는 소유자·저장소 불변 ID가 `@`로 붙는다. AWS 문서·블로그의 구 형식은 신규 저장소에서 깨지고 오류 메시지가 이유를 알려주지 않는다)
+  - CI push 배선 — 이미지 검증 완료(58.8 MB, `linux/arm64`, `ubuntu-24.04-arm` 러너)
+- [ ] **Step 2 — 코드 전환** (`CTR-011`, `MCP_STATELESS_HTTP`, `MCP_JSON_RESPONSE`)
+  - `app.py`가 `streamable_http_app(stateless_http=…, json_response=…)`을 설정에서 받아 넘긴다
+  - Dockerfile에 LWA 확장 1줄 + `AWS_LWA_*` 3개. **LWA가 Runtime Interface Client를 자체 포함**하므로 `python:3.14-slim-trixie` 베이스를 그대로 쓴다(AWS 공식 확인) — 베이스 이미지 교체 불필요
+  - `_GITHUB_HTTP_TIMEOUT_SECONDS` 30.0 → 20.0 (`EDGE-018`)
+- [ ] **Step 3 — 시크릿 이전: SSM Parameter Store Standard(`SecureString`)**
+  - Secrets Manager가 아니라 SSM을 쓴다 — Standard 파라미터는 **4 KB까지 무료**이고 KMS 암호화가 동일하다. GitHub App PEM이 약 1.7 KB로 들어간다. Secrets Manager는 시크릿당 **$0.40/월**(실측)이고 자동 로테이션이 유일한 차별점인데 GitHub App 키는 수동 교체다 → 월 $0.80 절감
+  - `/devoks-mcp/management/github-app-private-key`, `/devoks-mcp/management/client-tokens`
+- [ ] **Step 4 — Lambda 실행 역할 + 로그 그룹 + 함수 생성**
+  - 실행 역할: CloudWatch Logs 쓰기 + 위 2개 SSM 파라미터 `GetParameter` + KMS `Decrypt`만 (최소권한)
+  - 로그 그룹 보존기간 설정 — CloudWatch Logs 수집은 서울에서 **$0.76/GB**(실측)로 비싼 편이라 감사 레코드 양이 늘면 체감된다. 프리티어 5 GB/월
+  - 함수: ECR 이미지, `arm64`, 512 MB, 타임아웃 60초
+- [ ] **Step 5 — Function URL (`AuthType=NONE`)**
+  - `NONE`이 맞다 — `AWS_IAM`은 SigV4를 `Authorization` 헤더에 쓰므로 우리 Bearer 토큰과 정면 충돌한다. 인증 경계는 Stage 1에서 만든 OAuth 2.1 리소스 서버(`AC-002-*`)다
+  - **2단계 주입이 필요하다** — Function URL의 `<url-id>`는 생성 시점에 결정되므로, 함수 생성 → URL 확보 → `MCP_PUBLIC_URL=https://<url-id>.lambda-url.ap-northeast-2.on.aws/mcp`·`MCP_ALLOWED_HOSTS=<url-id>.lambda-url.ap-northeast-2.on.aws` 주입 순서다(`EDGE-019`)
+- [ ] **Step 6 — 실제 MCP 클라이언트(Claude Code) E2E 검증**
+  - 원격 등록 → `initialize` → 4툴 호출. allowlist 밖 저장소 거부·경로 트래버설 차단(`EDGE-013`)이 배포 환경에서도 재현되는지 확인
+  - `MCP_REPO_ALLOWLIST` 프로덕션 값 확정
+- [ ] **Step 7 — 커스텀 도메인 `mcp.devoks.kr` (API Gateway HTTP API)**
+  - **CloudFront가 아니다.** §7에 기록한 대로 CloudFront + Function URL은 OAC를 쓰는 순간 MCP와 비호환이고(POST 본문 SigV4 서명 요구), OAC를 포기해도 `AllViewerExceptHostHeader`가 필수여서 `Host`가 lambda-url 도메인으로 도착해 `MCP_PUBLIC_URL`과 강제로 갈라진다(`EDGE-019`). 인증된 POST-only JSON-RPC라 CDN 캐싱 가치도 0이다
+  - API Gateway HTTP API + Lambda 프록시 통합은 그 문제가 전부 없다: ACM 인증서가 **같은 리전**(`ap-northeast-2`), `Host`가 `mcp.devoks.kr`로 도착해 두 설정값이 **일치**, `Authorization` 기본 전달, 요금 **$1.23/백만 요청**(실측) → 월 $0
+  - 가비아 DNS에 CNAME 2건: ACM 검증용 underscore CNAME, `mcp` → API Gateway 리전 엔드포인트. (Route 53 위임은 월 $0.50이며 지금은 불필요 — ALIAS가 필요한 ALB가 없어졌다)
+  - 완료 후 `MCP_PUBLIC_URL`·`MCP_ALLOWED_HOSTS`를 도메인으로 전환
+- [ ] **Step 8 — CI 배포 스텝**
+  - GitHub Actions IAM 역할에 `lambda:UpdateFunctionCode` 추가(현재는 ECR push 전용). 기본 브랜치 push에서만 동작하도록 게이트
 - **미결 결정:**
-  - 저장소를 개인 계정 `ridsync/`에서 조직 `org-devoks/`로 이관할지 (§7)
-  - **저장소 공개 범위** — 현재 **PUBLIC**이다(`gh repo view` 실측, description "poc : mcp-servers for agent"). PoC 단계에서는 의도된 설정일 수 있고 **자격증명 유출 위험은 없다**(시크릿은 전부 런타임 env 주입이며 코드·CI에 리터럴이 없음을 스캔으로 확인, `.env`는 `.dockerignore`·`.gitignore`로 차단). 다만 공개 상태에서는 **사내 저장소 allowlist 값·서비스 계층 구성·조직명이 함께 공개**되므로, 실제 사내 지식을 다루기 시작하는 Stage 2 이전에 private 전환 여부를 판단해야 한다. CI가 arm64 러너를 **무료·무제한**으로 쓰는 근거가 public 저장소라는 점이므로(`TASK-031`), private 전환 시 러너 사용량 과금이 함께 발생한다.
+  - 저장소를 개인 계정 `ridsync/`에서 조직 `org-devoks/`로 이관할지 (§7). 이관 시 **immutable subject claim의 소유자 ID가 바뀌므로 Step 1의 IAM 신뢰 정책을 함께 갱신**해야 한다
+  - **저장소 공개 범위** — 현재 **PUBLIC**이다(`gh repo view` 실측, description "poc : mcp-servers for agent"). PoC 단계에서는 의도된 설정일 수 있고 **자격증명 유출 위험은 없다**(시크릿은 전부 런타임 주입이며 코드·CI에 리터럴이 없음을 스캔으로 확인, `.env`는 `.dockerignore`·`.gitignore`로 차단). 다만 공개 상태에서는 **사내 저장소 allowlist 값·서비스 계층 구성·조직명이 함께 공개**되므로, 실제 사내 지식을 다루기 시작하기 전에 private 전환 여부를 판단해야 한다. CI가 arm64 러너를 **무료·무제한**으로 쓰는 근거가 public 저장소라는 점이므로(`TASK-031`), private 전환 시 러너 사용량 과금이 함께 발생한다
   - 정적 Bearer → 사내 IdP OAuth 2.1 전환 시점과 IdP 선택 (`DSN-001`이 교체 지점을 `verifier.py`로 국소화해 둠)
-  - ALB idle timeout과 장시간 툴 호출의 관계 (Stage 1 툴은 모두 단발 조회라 해당 없음)
+  - ~~**AWS 계정 플랜(Free vs Paid)**~~ — **해소(2026-09-10)**: 계정 `703630528452`은 **Paid 플랜**이다(사용자 확인). 계정 자체는 오래 전에 생성됐고 IAM 사용자 `devoks`만 2026-09-04에 새로 만든 것 — 사용자 생성일을 계정 나이의 대리 지표로 삼은 것은 잘못된 추론이었다. 따라서 "크레딧 소진 시 계정 닫힘" 위험은 없다.
+    **비용 추정에는 영향이 없다** — 월 $0.01 추정의 근거인 Lambda 프리티어(월 100만 요청 + 400,000 GB-초)는 **12개월 한정이 아니라 상시 무료(always free)**라 계정 나이와 무관하다. CloudWatch Logs 5 GB, CloudFront 1 TB도 상시 무료다. 12개월 한정인 ECR 500 MB만 만료됐을 것이므로 이미지 61.7 MB × $0.10/GB-월 = **월 $0.006**이 실제로 청구되며, 이는 §10 추정에 이미 포함돼 있다
+  - 콜드스타트(`EDGE-016`)를 프로비저닝 동시성(월 $5.39)으로 제거할지 — Step 6의 실사용 체감으로 판단한다
 
 ### Stage 3 — Slackbot 연동
 

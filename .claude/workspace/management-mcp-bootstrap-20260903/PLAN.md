@@ -4,7 +4,7 @@ id: PLAN-management-mcp-bootstrap
 title: Management MCP 서버 부트스트랩 (Stage 1) 작업 계획
 status: done
 frd: ./FRD.md
-updated: 2026-09-03
+updated: 2026-09-10
 issue: https://github.com/ridsync/devoks-mcp-servers/issues/1
 ---
 
@@ -86,6 +86,8 @@ issue: https://github.com/ridsync/devoks-mcp-servers/issues/1
 - [ ] `TASK-046` **[Low]** `MCP_CLIENT_TOKENS` 최소 길이 검증 + `.env.example`·CI 예시 갱신 + README에 `secrets.token_urlsafe(32)` 안내 — file: `config.py`
 - [ ] `TASK-047` **[Low]** 테스트 픽스처 `conftest.py` 추출(`_generate_pem`·`_settings` 5개 파일 중복) — file: `servers/management/tests/conftest.py`
 - [ ] `TASK-048` Stage 2 진입 전 CI에 의존성 감사 스텝(`pip-audit` 또는 OSV 조회) 추가 — file: `.github/workflows/ci.yml`
+- [ ] `TASK-050` **[베이스 이미지 취약점]** ECR `scanOnPush`가 CRITICAL 6 / HIGH 11을 보고한다. **전부 `python:3.14-slim-trixie` 베이스의 Debian OS 패키지**이며 우리 Python 코드·의존성은 0건이다(OSV 40패키지 확인). `perl`이 21건 중 13건·CRITICAL 6건 중 5건을 차지하는데 **우리 서버는 perl을 호출하지 않는다**. Debian 보안 트래커 확인 결과 해당 CVE 전부 trixie에서 `status=open`·`fixed=-` — **`apt-get upgrade`로는 한 건도 줄지 않는다**(빌드 시간·레이어만 증가). 실효 있는 선택지: ① 미사용 패키지(`perl` 등) 제거 — CI 스모크가 검증 harness가 되므로 깨지면 즉시 드러난다 ② distroless/alpine 등 베이스 계열 전환 — musl·uv 조합 검증 필요. **현 위험 평가**: 이 CVE들은 컨테이너 안에서 이미 코드 실행이 가능한 상태를 전제하므로, 그 시점엔 CVE가 주 문제가 아니다. 배포를 막지 않되 공개 서비스로 굳히기 전에 ①을 시도할 가치가 있다 — file: `servers/management/Dockerfile`
+
 - [ ] `TASK-049` **[관측성]** 경로 트래버설·qualifier 인젝션 시도가 감사에 `outcome=error`로 남는다(메인 루프 재검증에서 관찰). 클라이언트 입력 검증에서 나온 `ToolError`라 그렇지만, 운영자가 "allowlist 탈출 시도"를 탐지하려면 `denied`를 본다. 보안 경계 위반은 `outcome=denied` + 전용 `reason_code`(예: `path_traversal_attempt`·`query_qualifier_injection`)로 분류해 탐지 가능하게 — file: `adapters/knowledge/github/client.py`, `tools/guard.py`, `types.py`
 
 > **PR4 완료** — `TASK-040`·`041`·`042` 3개 `[x]`. **테스트 235 → 282개**(신규 47: client 41 + tools 3 + credentials 3). 메인 루프 독립 재현으로 공격 5종(타 저장소 트래버설·툴 표면 이탈·qualifier 인젝션·백슬래시·대소문자 변형) **전부 차단 + GitHub 호출 0회** 확인, 정상 경로 6종 과잉 차단 없음 확인.
@@ -153,3 +155,45 @@ flowchart TD
   `platform: linux/arm64`, 러너 `ubuntu-24.04-arm`(네이티브, QEMU 없음). 로컬 Docker 미설치 제약은 그대로지만 **검증 자체는 닫혔다.**
 - [x] **`AC-007-3` CI 파이프라인 실동작 — 검증 완료.** 같은 run의 `Lint · type check · test` 잡도 success: `ruff check` → `All checks passed!` / `pyright` → `0 errors, 0 warnings, 0 informations` / `pytest` → `282 passed in 6.95s`. 두 잡 모두 통과해야 워크플로가 성공하며 `continue-on-error`는 없다.
 - [ ] **실 GitHub 대상 라이브 호출 미검증** — GitHub App(`RES-API-005`) 미생성(조직 관리자 작업). 전 경로가 `httpx2.MockTransport`로 검증됐고 JWT 클레임·헤더·엔드포인트·1MB/100MB 경계·rate limit 응답 형태는 **공식 문서와 대조**했으나, 실 자격증명으로 붙는 확인은 Stage 2 항목이다(FRD §10).
+
+
+---
+
+## 6. Stage 2 — AWS Lambda 실배포 Tasks
+
+> 배포 타깃이 **ECS/Fargate → Lambda + Function URL**로 변경 확정됐다(2026-09-10). 근거·대안 탈락 이유·미결 결정은 `FRD.md` §10 Stage 2에 있다.
+> §3의 Stage 1 Task(21개 완료 + 8개 후속)와 ID 공간을 공유하되 번호는 `TASK-051`부터 잇는다.
+
+### PR5 — Lambda 런타임 전환 (코드·이미지)
+
+이 PR은 **AWS 리소스를 만들지 않는다.** 로컬·CI에서 완결 검증되며, 그 뒤 인프라 Task가 이 이미지를 배포한다.
+
+- [x] `TASK-051` **[Small]** `MCP_STATELESS_HTTP`·`MCP_JSON_RESPONSE` 설정 키 추가. bool 파싱은 기존 Fail-Fast 규약(전 오류 수집)에 맞추고, 잘못된 리터럴은 기동 실패 — file: `config.py` / traces: `CTR-006`
+- [x] `TASK-052` **[Small]** `create_app`이 두 값을 `streamable_http_app(stateless_http=, json_response=)`로 전달. `session_manager.run()` lifespan은 **stateless에서도 유지**(SDK 소스 실측 — 세션 딕셔너리만 미사용, lifespan·task group은 그대로) — file: `app.py` / traces: `CTR-011`, `EDGE-019`
+- [x] `TASK-053` **[Small]** Dockerfile에 Lambda Web Adapter 확장 + `AWS_LWA_PORT`·`AWS_LWA_READINESS_CHECK_PATH`·`AWS_LWA_INVOKE_MODE`. LWA가 Runtime Interface Client를 포함하므로 **베이스 이미지 교체 불필요**. 확장은 Lambda 런타임에서만 기동하므로 로컬 `docker run` 무영향 — file: `servers/management/Dockerfile` / traces: `CTR-010`, `CTR-011`
+- [x] `TASK-054` **[Small]** `_GITHUB_HTTP_TIMEOUT_SECONDS` 30.0 → 20.0. API Gateway HTTP API 통합 타임아웃이 **30초 하드 한계**라 동일 값이면 여유가 0이고, 504가 나면 툴 오류 정규화 경로(`EDGE-003`/`EDGE-009`)를 타지 못한다 — file: `app.py` / traces: `EDGE-018`
+- [x] `TASK-055` **[Medium]** 위 4건 테스트. ① 두 키의 기본값·오버라이드·잘못된 리터럴 기동 실패 ② `stateless_http=True`에서 `/mcp` POST가 `Mcp-Session-Id` **없이** 200 + `application/json` ③ 기존 401/403/421 단정이 그대로 유지 ④ `Accept: text/event-stream`만 보내는 클라이언트의 거동 확인 — file: `tests/test_config.py`, `tests/test_app.py` / traces: `CTR-006`, `CTR-011`
+
+**PR5 검증 결과 (2026-09-10):**
+
+- `pytest` → **303 passed** (전환 전 282 → +21: config 6종, HTTP 와이어 6종 + 파라미터화 4케이스)
+- `ruff check` → `All checks passed!` / `ruff format --check` → `37 files already formatted` / `pyright` → `0 errors, 0 warnings, 0 informations`
+- **두 플래그가 완전히 독립임을 실측 후 테스트로 고정** — `stateless_http`는 `Mcp-Session-Id` 발급 여부, `json_response`는 응답 미디어타입을 각각 제어한다. 4가지 조합 전부 파라미터화. 판별에는 **legacy `2025-11-25` 레그**를 쓴다 — `2026-07-28`은 어느 플래그든 세션을 발급하지 않아 테스트가 엉뚱한 이유로 통과한다
+- **실 클라이언트 왕복 회귀 가드** — `streamable_http_client` + `ClientSession`으로 `initialize` → `notifications/initialized` → `tools/list`가 stateless-JSON에서 성공하고 4툴이 그대로 보인다
+- `Settings`에 dataclass 기본값을 **주지 않았다** — 기본값의 단일 출처를 `config.py`로 유지해야 하며 양쪽에 두면 갈라진다. 대신 테스트 헬퍼 7곳을 명시적으로 갱신했다(이 중복이 `TASK-047` conftest 추출의 근거를 강화한다)
+- `.env.example` 16개 키 전량 파싱 재확인(PEM만 실제 키로 교체하는 README 절차 그대로)
+- ⚠️ **Dockerfile 변경은 로컬 검증 불가** — Docker 미설치(FRD §7). LWA `COPY --from`과 `AWS_LWA_*`는 **CI 빌드가 최초 검증자**다. LWA 태그 `1.1.0`의 존재·`linux/arm64` 매니페스트는 ECR Public 레지스트리 API로 사전 확인했다
+
+### PR6 — AWS 리소스 (되돌리기 어려움 → 각 Task 실행 전 사용자 확인)
+
+- [ ] `TASK-056` **[Small]** 시크릿을 SSM Parameter Store Standard(`SecureString`)로 이전 — `/devoks-mcp/management/github-app-private-key`, `/devoks-mcp/management/client-tokens`. Secrets Manager 대신 SSM인 이유: 4 KB까지 무료(PEM 약 1.7 KB), KMS 암호화 동일, 월 $0.80 절감. 값은 로컬 `.env`에서 읽고 대화에 출력하지 않는다 — file: `infra/02-secrets.sh` / traces: FRD §10 Step 3
+- [ ] `TASK-057` **[Medium]** Lambda 실행 역할(CloudWatch Logs 쓰기 + 위 2개 파라미터 `GetParameter` + KMS `Decrypt`만) + 로그 그룹(보존기간 설정 — 서울 수집 $0.76/GB) + 함수 생성(ECR 이미지, `arm64`, 512 MB, 타임아웃 60초) — file: `infra/03-lambda.sh` / traces: FRD §10 Step 4
+- [ ] `TASK-058` **[Small]** Function URL `AuthType=NONE` 생성 후 **2단계 주입** — `<url-id>`가 생성 시점에 결정되므로 URL 확보 후 `MCP_PUBLIC_URL`(`…/mcp` 경로 필수)·`MCP_ALLOWED_HOSTS`를 주입한다. `AWS_IAM`이 아닌 이유: SigV4가 `Authorization` 헤더를 점유해 Bearer와 충돌 — file: `infra/03-lambda.sh` / traces: `EDGE-019`, FRD §10 Step 5
+- [ ] `TASK-059` **[Medium]** 실제 MCP 클라이언트(Claude Code) E2E — 원격 등록 → `initialize` → 4툴 호출. allowlist 밖 저장소 거부·경로 트래버설 차단(`EDGE-013`)·qualifier 주입 차단(`EDGE-014`)이 **배포 환경에서도** 재현되는지 확인. `MCP_REPO_ALLOWLIST` 프로덕션 값 확정. 콜드스타트 실측(`EDGE-016`) — traces: `AC-005-*`, `EDGE-013`, `EDGE-014`, `EDGE-016`
+- [ ] `TASK-060` **[Medium]** 커스텀 도메인 `mcp.devoks.kr` — **API Gateway HTTP API**(CloudFront 아님, 근거 FRD §7·§10 Step 7). ACM 인증서(`ap-northeast-2`) + HTTP API + Lambda 프록시 통합 + 커스텀 도메인 + 가비아 CNAME 2건(ACM 검증 underscore, `mcp` → 리전 엔드포인트). 완료 후 `MCP_PUBLIC_URL`·`MCP_ALLOWED_HOSTS` 전환 — file: `infra/04-custom-domain.sh` / traces: `CTR-001`, `EDGE-018`, `EDGE-019`
+- [ ] `TASK-061` **[Small]** CI 배포 스텝 — GitHub Actions IAM 역할에 `lambda:UpdateFunctionCode` 추가(현재 ECR push 전용), 기본 브랜치 push에서만 동작하도록 게이트 — file: `.github/workflows/ci.yml`, `infra/01-ecr-and-github-oidc.sh` / traces: `AC-007-3`, FRD §10 Step 8
+
+### Stage 2 착수 전 확인 (블로킹)
+
+- [x] **AWS 계정 플랜(Free vs Paid)** — **해소(2026-09-10)**: **Paid 플랜**(사용자 확인). 계정은 오래 전 생성됐고 IAM 사용자 `devoks`만 2026-09-04에 신규 생성된 것이다. 계정 닫힘 위험 없음. 비용 추정도 불변 — Lambda 프리티어는 **상시 무료**라 계정 나이와 무관하다(12개월 한정인 ECR 500 MB만 만료 → 월 $0.006, 추정에 이미 포함)
+- [ ] **AWS Budgets 알림** — 2개까지 무료. 월 $10 임계값(Lambda 구성 기준으로는 넉넉) 알림 설정
