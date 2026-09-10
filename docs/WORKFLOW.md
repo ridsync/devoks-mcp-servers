@@ -230,9 +230,28 @@ MCP Streamable HTTP는 전부 POST다. OAC를 포기해도
 `MCP_PUBLIC_URL`과 **강제로 갈라진다**(`EDGE-019`).
 
 → **API Gateway HTTP API**로 전환. 같은 리전 ACM, `Host`가 그대로 도착,
-`Authorization` 기본 전달, $1.23/백만 요청. 도메인 없이 기본 엔드포인트로
-전수 검증했다(무인증 `POST /mcp`가 **401이고 421이 아닌 것**이 Host 검증
-통과의 증거). 통합 타임아웃 실측 **30,000 ms**가 `EDGE-018`의 근거다.
+`Authorization` 기본 전달, $1.23/백만 요청. 통합 타임아웃 실측 **30,000 ms**가
+`EDGE-018`의 근거다.
+
+**`https://mcp.devoks.kr/mcp` 라이브.** TLS 1.3 / `CN=mcp.devoks.kr` / Amazon
+발급 / 자동 갱신. well-known `resource`가 도메인과 정확히 일치하고(`AC-002-4`),
+무인증 `POST /mcp`가 **401이고 421이 아닌 것**이 Host 검증 통과의 증거다.
+
+ACM이 `PENDING_VALIDATION`에 머물 때 기다리지 않고 좁혔다: CAA 없음, 기대값 대
+실제값 문자 단위 일치, `FailureReason` 없음 → 폴링 백오프. 확인차 **검증 CNAME이
+같은 도메인·계정에서 결정적인지 실측**했고(동일) 그 사이 원래 인증서도 발급됐다.
+
+### 15. 검증이 구버전을 시험하고 있었다
+
+도메인 검증 직후 감사 로그에 `TASK-049`의 신규 `reason_code`가 없었다. 함수가
+`e9973e1f` 이미지로 돌고 있었고 **CI 배포 스텝은 기본 브랜치 전용**이라
+`TASK-043~050`의 코드가 프로덕션에 없었다. HEAD 이미지를 배포한 뒤 재검증하니
+**같은 로그에 전/후가 나란히** 남았다 — 배포 전 `error`/`ToolError`, 배포 후
+`denied`/`path_traversal_attempt`·`query_qualifier_injection`. 클라이언트 응답
+문자열은 양쪽 동일해 `AC-003-5`도 유지됐다.
+
+> **교훈**: "코드를 고쳤다"와 "고친 코드가 돌고 있다"는 별개다. 라이브 검증은
+> 배포된 이미지 태그를 먼저 확인해야 한다.
 
 ---
 
@@ -248,8 +267,13 @@ MCP Streamable HTTP는 전부 POST다. OAC를 포기해도
 
 각 스크립트 머리에 **무엇이 발목을 잡았는지**와 **검증 범위**를 적어뒀다.
 
+## 현재 상태
+
+**`https://mcp.devoks.kr/mcp`** — Lambda(arm64/512MB) ← API Gateway HTTP API
+← ACM(자동 갱신). 월 비용 약 **$0.51**(ECR 저장 $0.01 + Route 53 미사용,
+Lambda·CloudWatch·ACM·API Gateway 전부 프리티어 내). Task 43/43 완료.
+
 ## 남은 작업
 
-- `TASK-060` — 가비아 DNS 활성화 + CNAME 2건 (사람 작업)
 - FRD §10 미결: 저장소 공개 범위 · 조직 이관 · 정적 Bearer → OAuth
 - Stage 3 — Slackbot 연동
