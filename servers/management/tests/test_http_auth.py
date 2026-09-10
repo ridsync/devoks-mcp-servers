@@ -24,6 +24,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import httpx2
+import pytest
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from starlette.applications import Starlette
@@ -38,7 +39,12 @@ _VALID_TOKEN = "secret-token"  # noqa: S105 -- test fixture literal, not a real 
 _NO_SCOPE_TOKEN = "no-scope-token"  # noqa: S105 -- test fixture literal, not a real credential
 
 
-def _settings(*, client_tokens: dict[str, ClientToken] | None = None) -> Settings:
+def _settings(
+    *,
+    client_tokens: dict[str, ClientToken] | None = None,
+    stateless_http: bool = True,
+    json_response: bool = True,
+) -> Settings:
     # Direct dataclass construction, not load_settings() -- same pattern
     # test_app.py already uses for HTTP/wiring tests that never touch
     # github_app_private_key content. Duplicated here rather than imported
@@ -60,6 +66,8 @@ def _settings(*, client_tokens: dict[str, ClientToken] | None = None) -> Setting
         read_file_max_bytes=262_144,
         search_code_max_results=30,
         token_refresh_leeway_seconds=300,
+        stateless_http=stateless_http,
+        json_response=json_response,
         client_tokens=client_tokens
         if client_tokens is not None
         else {_VALID_TOKEN: ClientToken(client_id="c1", role="reader", scopes=("devoks:read",))},
@@ -230,3 +238,131 @@ async def test_missing_token_with_disallowed_host_returns_401_not_421() -> None:
     assert response.status_code == 401
     assert response.status_code != 421
     assert 'error="invalid_token"' in response.headers.get("www-authenticate", "")
+
+
+# --- CTR-011 / EDGE-019: protocol mode is what makes Lambda deployable (TASK-055) ---
+#
+# Measured, not assumed. The four combinations below were probed against the
+# installed mcp==2.1.1 before these assertions were written, and they are
+# fully orthogonal:
+#
+#   stateless_http -> controls whether `Mcp-Session-Id` is issued at all
+#   json_response  -> controls the response media type (JSON vs SSE stream)
+#
+# The legacy `2025-11-25` leg is used deliberately: it is the only leg that
+# issues session IDs (FRD §7's protocol-leg table), so it is the only leg on
+# which `stateless_http` is observable. On `2026-07-28` no session is issued
+# regardless of the flag, which would make the test pass for the wrong reason.
+# (That leg also requires `params._meta` to carry the protocol-version
+# marker; a hand-rolled POST without it is rejected -32602, which is why the
+# full-handshake test below drives `ClientSession` instead of raw JSON.)
+
+_LEGACY_PROTOCOL_VERSION = "2025-11-25"
+
+_INITIALIZE_BODY = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": _LEGACY_PROTOCOL_VERSION,
+        "capabilities": {},
+        "clientInfo": {"name": "task-055-probe", "version": "0"},
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("stateless_http", "json_response", "expected_media_type", "expects_session_id"),
+    [
+        # The Lambda-required combination (CTR-011 defaults): a single
+        # complete JSON body and no session for a later invocation to lose.
+        (True, True, "application/json", False),
+        # The sticky-load-balancer combination (FRD §7 option (a)).
+        (False, False, "text/event-stream", True),
+        # Both off-diagonals, asserted so a future change that collapses the
+        # two flags into one knob fails loudly instead of quietly coupling
+        # session issuance to the media type.
+        (True, False, "text/event-stream", False),
+        (False, True, "application/json", True),
+    ],
+)
+async def test_protocol_mode_flags_control_session_and_media_type_independently(
+    stateless_http: bool,
+    json_response: bool,
+    expected_media_type: str,
+    expects_session_id: bool,
+) -> None:
+    app = create_app(_settings(stateless_http=stateless_http, json_response=json_response))
+
+    async with _running_client(app) as client:
+        response = await client.post(
+            "/mcp",
+            json=_INITIALIZE_BODY,
+            headers={
+                "Authorization": f"Bearer {_VALID_TOKEN}",
+                "Accept": "application/json, text/event-stream",
+                "MCP-Protocol-Version": _LEGACY_PROTOCOL_VERSION,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(expected_media_type)
+    assert (response.headers.get("mcp-session-id") is not None) is expects_session_id
+
+
+async def test_default_settings_are_the_lambda_safe_combination() -> None:
+    """The deployed default must need no extra env configuration to be
+    Lambda-correct. ``_settings()`` here mirrors ``load_settings``' defaults
+    (both ``True``, asserted directly in test_config.py), so this pins the
+    end-to-end consequence: no session handed out, plain JSON back.
+    """
+    app = create_app(_settings())
+
+    async with _running_client(app) as client:
+        response = await client.post(
+            "/mcp",
+            json=_INITIALIZE_BODY,
+            headers={
+                "Authorization": f"Bearer {_VALID_TOKEN}",
+                "Accept": "application/json, text/event-stream",
+                "MCP-Protocol-Version": _LEGACY_PROTOCOL_VERSION,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert "mcp-session-id" not in response.headers
+
+
+async def test_full_handshake_still_succeeds_in_stateless_json_mode() -> None:
+    """The load-bearing regression guard for the Lambda switch: dropping
+    sessions must not break the handshake a real MCP client drives.
+
+    ``streamable_http_client`` + ``ClientSession`` negotiate for real (the
+    SDK's own client defaults to the legacy leg -- FRD §7), so this covers
+    ``initialize`` -> ``notifications/initialized`` -> ``tools/list`` with no
+    session ID in play at any point. If stateless mode broke resumability in
+    a way that also broke the plain request/response path, this fails.
+    """
+    app = create_app(_settings(stateless_http=True, json_response=True))
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app),
+            base_url=f"https://{_ALLOWED_HOST}",
+            headers={"Authorization": f"Bearer {_VALID_TOKEN}"},
+        ) as http_client,
+        streamable_http_client("/mcp", http_client=http_client) as (read_stream, write_stream),
+        ClientSession(read_stream, write_stream) as session,
+    ):
+        init_result = await session.initialize()
+        tools_result = await session.list_tools()
+
+    assert init_result.server_info.name == SERVER_NAME
+    assert {tool.name for tool in tools_result.tools} == {
+        "list_repos",
+        "get_repo_tree",
+        "read_file",
+        "search_code",
+    }

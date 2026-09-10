@@ -400,6 +400,88 @@ def test_invalid_log_level_fails_startup(pem: str) -> None:
         load_settings(env)
 
 
+# --- CTR-011: MCP_STATELESS_HTTP / MCP_JSON_RESPONSE (TASK-051) ------------------
+
+
+def test_protocol_mode_defaults_to_stateless_json_for_lambda(pem: str) -> None:
+    """Both default to ``True`` because the deployment target is Lambda +
+    Function URL (FRD §10 Stage 2). Asserted as an explicit fact rather than
+    left implicit: flipping either default silently changes the wire
+    protocol -- ``False``/``False`` makes the server issue ``Mcp-Session-Id``
+    and stream SSE, which a Lambda execution environment cannot honor across
+    invocations (FRD §7 "배포 타깃 제약").
+    """
+    settings = load_settings(_valid_env(pem))
+    assert settings.stateless_http is True
+    assert settings.json_response is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("true", True),
+        ("TRUE", True),
+        ("1", True),
+        ("yes", True),
+        ("on", True),
+        ("false", False),
+        ("False", False),
+        ("0", False),
+        ("no", False),
+        ("off", False),
+        ("  true  ", True),
+    ],
+)
+def test_protocol_mode_accepts_documented_literals_case_insensitively(
+    pem: str, raw: str, expected: bool
+) -> None:
+    env = _valid_env(pem)
+    env["MCP_STATELESS_HTTP"] = raw
+    env["MCP_JSON_RESPONSE"] = raw
+    settings = load_settings(env)
+    assert settings.stateless_http is expected
+    assert settings.json_response is expected
+
+
+def test_protocol_mode_rejects_unknown_literal_instead_of_guessing(pem: str) -> None:
+    """``bool("false")`` is ``True`` in Python, so a permissive parser would
+    turn the typo ``MCP_STATELESS_HTTP=flase`` into stateless mode silently.
+    DSN-006 requires the opposite: fail start-up.
+    """
+    env = _valid_env(pem)
+    env["MCP_STATELESS_HTTP"] = "flase"
+    with pytest.raises(ConfigError, match="MCP_STATELESS_HTTP"):
+        load_settings(env)
+
+
+def test_both_protocol_mode_errors_are_reported_together(pem: str) -> None:
+    """DSN-006's all-errors-collected contract: an operator fixing a bad
+    deployment must see both bad keys in one run, not discover the second
+    only after fixing the first.
+    """
+    env = _valid_env(pem)
+    env["MCP_STATELESS_HTTP"] = "maybe"
+    env["MCP_JSON_RESPONSE"] = "sometimes"
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings(env)
+    message = str(excinfo.value)
+    assert "MCP_STATELESS_HTTP" in message
+    assert "MCP_JSON_RESPONSE" in message
+
+
+def test_empty_protocol_mode_value_falls_back_to_default(pem: str) -> None:
+    """An env key present but empty (a very common shape when a deployment
+    template renders an unset variable) must behave as unset, matching how
+    every other optional key in CTR-006 already treats blanks.
+    """
+    env = _valid_env(pem)
+    env["MCP_STATELESS_HTTP"] = ""
+    env["MCP_JSON_RESPONSE"] = "   "
+    settings = load_settings(env)
+    assert settings.stateless_http is True
+    assert settings.json_response is True
+
+
 # --- secret exposure ------------------------------------------------------------
 
 

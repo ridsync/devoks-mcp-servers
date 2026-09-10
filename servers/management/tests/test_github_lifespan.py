@@ -142,6 +142,8 @@ def _settings(
         read_file_max_bytes=262_144,
         search_code_max_results=30,
         token_refresh_leeway_seconds=300,
+        stateless_http=True,
+        json_response=True,
         client_tokens={},
         github_app_private_key=private_key,
     )
