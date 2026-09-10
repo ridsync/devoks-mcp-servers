@@ -138,7 +138,14 @@ _DISTRIBUTION_NAME = "devoks_mcp_management"
 #: enough that a genuinely stuck connection still surfaces as an ordinary
 #: ``ToolError`` (via ``client.py``'s own ``httpx2.HTTPError`` handling)
 #: within one request's lifetime rather than hanging it forever.
-_GITHUB_HTTP_TIMEOUT_SECONDS: Final = 30.0
+# EDGE-018: kept strictly *below* the fronting layer's own ceiling so this
+# server is always the one that times out first. API Gateway HTTP API's
+# integration timeout is a hard 30s maximum (configurable 50–30,000 ms, not
+# raisable), so an equal 30.0 here left zero headroom: a slow GitHub reply
+# would surface as an API Gateway 504 that never passes through this
+# server's own error normalization (EDGE-003 rate-limit hint / EDGE-009
+# tool-error shaping), losing the audit record's `error_kind` too.
+_GITHUB_HTTP_TIMEOUT_SECONDS: Final = 20.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,7 +328,25 @@ def create_app(settings: Settings) -> Starlette:
         allowed_origins=[],
     )
 
-    mcp_app = mcp.streamable_http_app(transport_security=security)
+    # CTR-011 / FRD §7 "배포 타깃 제약": both flags come from settings so the
+    # one image runs on Lambda (both True — the default) and, unchanged,
+    # behind a sticky-session load balancer (both False).
+    #
+    # `stateless_http=True` does NOT remove the need for the `lifespan()`
+    # below. Verified against the installed mcp==2.1.1 source:
+    # `StreamableHTTPSessionManager.run()` is what enters the MCP-protocol
+    # lifespan (`_make_github_lifespan`, passed to `create_server` above) and
+    # creates the anyio task group that `_handle_stateless_request` starts
+    # each per-request transport in. Stateless mode only stops the manager
+    # from tracking `_server_instances`/`_session_owners`; it does not make
+    # `run()` optional. `run()` also raises RuntimeError if called twice per
+    # instance, which is why the app must be built once per process (uvicorn
+    # boots it once per container) and never per Lambda invocation.
+    mcp_app = mcp.streamable_http_app(
+        transport_security=security,
+        stateless_http=settings.stateless_http,
+        json_response=settings.json_response,
+    )
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncGenerator[None]:

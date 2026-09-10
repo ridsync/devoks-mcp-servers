@@ -39,6 +39,8 @@ def _settings(
     public_url: str = _PUBLIC_URL,
     client_tokens: dict[str, ClientToken] | None = None,
     log_level: str = "INFO",
+    stateless_http: bool = True,
+    json_response: bool = True,
 ) -> Settings:
     # Direct dataclass construction, not load_settings() -- same pattern
     # test_server.py already uses for HTTP/wiring tests that never touch
@@ -58,6 +60,8 @@ def _settings(
         read_file_max_bytes=262_144,
         search_code_max_results=30,
         token_refresh_leeway_seconds=300,
+        stateless_http=stateless_http,
+        json_response=json_response,
         client_tokens=client_tokens
         if client_tokens is not None
         else {_VALID_TOKEN: ClientToken(client_id="c1", role="reader", scopes=("devoks:read",))},

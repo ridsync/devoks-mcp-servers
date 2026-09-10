@@ -5,7 +5,7 @@
 
 이 문서는 **Management MCP 서버(Stage 1)** 기준으로 작성됐다. 요구사항·설계 결정·실측으로
 확인된 함정의 전체 근거는 워크스페이스 문서에 있다 — 이 README는 그 요약이 아니라
-**"막히는 지점을 미리 치워주는" 실행 가이드**다. Stage 2(ECS/Fargate 배포)·Stage 3(Slackbot
+**"막히는 지점을 미리 치워주는" 실행 가이드**다. Stage 2(AWS Lambda 배포)·Stage 3(Slackbot
 연동)의 잔여 작업·미결 결정은 이 문서에 복제하지 않고 아래에서 가리키기만 한다:
 
 - `.claude/workspace/management-mcp-bootstrap-20260903/FRD.md` — 요구사항·계약(Contract)·
@@ -24,7 +24,7 @@
 | Runtime — Sentry/Grafana/CloudWatch/GitHub CI | ❌ 미구현 (FRD §10) |
 | Business — Data API/Read DB/Analytics | ❌ 미구현 (FRD §10) |
 | Slackbot (MCP 클라이언트) | ❌ 미구현 — Stage 3 |
-| ECS/Fargate 실배포 | ❌ 미구현 — Stage 2. 로컬은 `uv run`, 컨테이너 기동 검증은 CI만 수행 |
+| AWS Lambda 실배포 | 🟡 진행 중 — Stage 2. ECR 이미지 공급 경로·OIDC 완료, 런타임 전환(LWA + stateless/JSON) 완료, AWS 리소스 생성 남음. 로컬은 `uv run`, 컨테이너 기동 검증은 CI만 수행 |
 
 Auth(Bearer 토큰 검증)·RBAC(역할×툴×저장소 인가)·Audit(감사 로그) 골격은 계층이 늘어나도
 바뀌지 않도록 Stage 1에서 이미 고정해 뒀다.
@@ -190,7 +190,7 @@ claude mcp add --transport http devoks-management \
 ## 감사 로그
 
 모든 툴 호출은 성공·거부·오류와 무관하게 stdout에 **JSON Lines 1줄**로 남는다(필드는
-FRD `CTR-003`). ECS 로그 드라이버가 그대로 수집한다. **`MCP_LOG_LEVEL`(서버 로그
+FRD `CTR-003`). Lambda가 stdout을 CloudWatch Logs로 그대로 수집한다. **`MCP_LOG_LEVEL`(서버 로그
 레벨)과는 완전히 별개**이며, 그 값으로 필터링되지 않는다 — 감사 로그는 항상 전량
 남는다.
 
@@ -230,8 +230,8 @@ docker buildx build --platform linux/arm64 \
 
 ## Stage 2 · Stage 3 로드맵
 
-이번 저장소 상태(Stage 1)에서 다음 세션이 이어받을 작업과 미결 결정 사항(ECS/Fargate
-배포, legacy 프로토콜 레그 확장 방식, 저장소 공개 범위, 정적 토큰 → OAuth 전환,
+이번 저장소 상태(Stage 1)에서 다음 세션이 이어받을 작업과 미결 결정 사항(Lambda
+배포 잔여 단계, 저장소 공개 범위, 정적 토큰 → OAuth 전환,
 Slackbot 연동 등)은 전부 FRD에 기록돼 있다 — 여기서 다시 나열하지 않는다:
 
 → `.claude/workspace/management-mcp-bootstrap-20260903/FRD.md` §10 Roadmap

@@ -192,6 +192,56 @@ WORKDIR /app
 # file into a new layer) for no behavioral benefit.
 COPY --from=builder /app/.venv /app/.venv
 
+# ---------------------------------------------------------------------------
+# CTR-011 — AWS Lambda Web Adapter (LWA), the deployment target's bridge.
+#
+# The deployment target is Lambda + Function URL (FRD §10 Stage 2). LWA is a
+# Lambda *extension*: Lambda's init process starts anything under
+# /opt/extensions, and LWA then polls the Lambda Runtime API and translates
+# each invocation into a plain HTTP request against the web server this
+# image already runs (the CMD below, unchanged).
+#
+# WHY THIS DOES NOT REQUIRE AN AWS BASE IMAGE:
+# LWA ships the Lambda Runtime Interface Client itself, so a non-AWS base
+# image is supported — `python:3.14-slim-trixie` stays exactly as it is
+# (verified against aws/aws-lambda-web-adapter's own documentation). Without
+# that property this stage would have had to move to
+# public.ecr.aws/lambda/python, which does not publish a 3.14 tag and would
+# have collided with the PEP 758 floor documented at the top of this file.
+#
+# WHY IT IS SAFE FOR NON-LAMBDA RUNTIMES:
+# An extension is only started by the Lambda init process. `docker run` and
+# any container orchestrator never look at /opt/extensions, so this binary
+# is an inert ~10 MB file there — the same image keeps working unchanged for
+# local iteration and for TASK-031's CI smoke test (which is what verifies
+# that claim on every push).
+#
+# Tag 1.1.0 is pinned (not `:latest`) for the same reason uv 0.11.4 is
+# pinned above. Existence and linux/amd64+arm64 manifest support verified
+# against the ECR Public registry API before writing this line — CTR-010
+# targets linux/arm64, so an amd64-only adapter would have silently produced
+# an image whose extension cannot execute.
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.1.0 \
+    /lambda-adapter /opt/extensions/lambda-adapter
+
+# AWS_LWA_PORT: LWA defaults to 8080; this server listens on $MCP_PORT.
+# The two MUST move together — overriding MCP_PORT in a Lambda function's
+# environment without overriding AWS_LWA_PORT makes LWA poll a port nothing
+# is bound to, and every invocation times out with no application log line
+# to explain it. Both are 8000 here (config.py's `_DEFAULT_PORT`, CTR-006).
+# AWS_LWA_READINESS_CHECK_PATH: CTR-001's health endpoint. LWA holds the
+# first invocation until this returns 2xx, which is what makes the cold
+# start (EDGE-016) wait for the MCP session manager's lifespan — including
+# `_make_github_lifespan` — instead of racing it.
+# AWS_LWA_INVOKE_MODE=BUFFERED: correct because MCP_JSON_RESPONSE defaults
+# to true (CTR-011), so every response is a single complete JSON body.
+# RESPONSE_STREAM would additionally require the Function URL itself to be
+# created with InvokeMode=RESPONSE_STREAM; keeping both sides buffered
+# avoids a split-brain configuration that only shows up under load.
+ENV AWS_LWA_PORT=8000 \
+    AWS_LWA_READINESS_CHECK_PATH=/healthz \
+    AWS_LWA_INVOKE_MODE=BUFFERED
+
 # Numeric form (not `USER app`) so the identity is resolvable by tooling
 # that inspects the image without running it (host-side security scanners,
 # `docker inspect`, an ECS task definition's own `user` field) — hadolint
@@ -207,13 +257,11 @@ EXPOSE 8000
 
 # Useful for local `docker run`/`docker compose` iteration; TASK-031's own
 # CI smoke test curls /healthz directly rather than relying on this. Not
-# meaningful in the eventual ECS/Fargate deployment (Stage 2) — Fargate task
-# definitions declare their own container health check (or rely on the
-# ALB target group's), and do not consult a Dockerfile HEALTHCHECK. Kept
-# anyway because the cost is one instruction and the local-iteration value
-# is real; drop it in Stage 2 if it turns out to just add a confusing,
-# unrelated "unhealthy" signal to `docker ps`/ECS console alongside the
-# ALB's own check. Uses the venv's own Python (no curl in the slim base
+# meaningful on Lambda (Stage 2's deployment target) — Lambda never consults
+# a Dockerfile HEALTHCHECK; readiness there is LWA's own
+# AWS_LWA_READINESS_CHECK_PATH probe against this same /healthz endpoint,
+# configured above. Kept anyway because the cost is one instruction and the
+# local-iteration value is real. Uses the venv's own Python (no curl in the slim base
 # image, and installing one via apt would mean an extra layer purely for
 # this) so the process being checked and the process doing the checking run
 # under the exact same interpreter/environment.
@@ -225,10 +273,12 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 # attribute — see app.py's own docstring), hence `--factory`.
 #
 # Exec-form CMD (JSON array) is required so uvicorn receives SIGTERM
-# directly as PID 1 — ECS sends SIGTERM then waits out a grace period before
-# SIGKILL, and a shell-form CMD would leave a shell as PID 1 that swallows
-# that signal instead of forwarding it, turning every deploy/task
-# replacement into a hard kill instead of a graceful shutdown. But
+# directly as PID 1 — a container runtime sends SIGTERM then waits out a
+# grace period before SIGKILL, and a shell-form CMD would leave a shell as
+# PID 1 that swallows that signal instead of forwarding it, turning every
+# replacement into a hard kill instead of a graceful shutdown. On Lambda the
+# same exec form matters for a different reason: the process LWA proxies to
+# must be the one that owns the port, not a child of a lingering shell. But
 # `--port $MCP_PORT` needs *shell* expansion — a JSON-array CMD's arguments
 # are passed to execve() verbatim, with no variable substitution performed.
 # `sh -c '... exec ...'` gets both: Docker execs `sh` directly (JSON array,

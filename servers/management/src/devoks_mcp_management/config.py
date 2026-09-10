@@ -70,6 +70,25 @@ _REPO_ALLOWLIST_ENTRY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _ENV_READ_FILE_MAX_BYTES = "MCP_READ_FILE_MAX_BYTES"
 _ENV_SEARCH_CODE_MAX_RESULTS = "MCP_SEARCH_CODE_MAX_RESULTS"
 _ENV_TOKEN_REFRESH_LEEWAY_SECONDS = "MCP_TOKEN_REFRESH_LEEWAY_SECONDS"
+_ENV_STATELESS_HTTP = "MCP_STATELESS_HTTP"
+_ENV_JSON_RESPONSE = "MCP_JSON_RESPONSE"
+
+# CTR-011: both default to True because the deployment target is Lambda +
+# Function URL (FRD §10 Stage 2). A Lambda execution environment is frozen
+# between invocations and replaced without warning, so a server that issues
+# `Mcp-Session-Id` would hand clients a session no later invocation can be
+# guaranteed to still hold; and an SSE stream that outlives the response is
+# incompatible with the freeze. Flip both to `false` to run this same image
+# behind a sticky-session load balancer instead (FRD §7's option (a)).
+_DEFAULT_STATELESS_HTTP = True
+_DEFAULT_JSON_RESPONSE = True
+
+# Accepted spellings for the two boolean keys. Deliberately a closed set
+# rather than Python's `bool(str)` (which makes "false" truthy) or
+# `distutils.util.strtobool` (removed in 3.12): a typo'd value must be a
+# start-up failure per DSN-006, not a silently-wrong protocol mode.
+_TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
+_FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
 
 class ConfigError(Exception):
@@ -114,6 +133,8 @@ class Settings:
     read_file_max_bytes: int
     search_code_max_results: int
     token_refresh_leeway_seconds: int
+    stateless_http: bool
+    json_response: bool
     client_tokens: Mapping[str, ClientToken] = field(repr=False)
     github_app_private_key: str = field(repr=False)
 
@@ -242,6 +263,22 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         errors.append(str(exc))
         token_refresh_leeway_seconds = TOKEN_REFRESH_LEEWAY_SECONDS_DEFAULT
 
+    try:
+        stateless_http = _parse_bool(
+            env.get(_ENV_STATELESS_HTTP), _ENV_STATELESS_HTTP, _DEFAULT_STATELESS_HTTP
+        )
+    except _FieldError as exc:
+        errors.append(str(exc))
+        stateless_http = _DEFAULT_STATELESS_HTTP
+
+    try:
+        json_response = _parse_bool(
+            env.get(_ENV_JSON_RESPONSE), _ENV_JSON_RESPONSE, _DEFAULT_JSON_RESPONSE
+        )
+    except _FieldError as exc:
+        errors.append(str(exc))
+        json_response = _DEFAULT_JSON_RESPONSE
+
     if errors:
         raise ConfigError("; ".join(errors))
 
@@ -258,6 +295,8 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         read_file_max_bytes=read_file_max_bytes,
         search_code_max_results=search_code_max_results,
         token_refresh_leeway_seconds=token_refresh_leeway_seconds,
+        stateless_http=stateless_http,
+        json_response=json_response,
         client_tokens=client_tokens,
         github_app_private_key=github_app_private_key,
     )
@@ -456,6 +495,19 @@ def _parse_int_in_range(raw: str | None, key: str, default: int, minimum: int, m
     if not (minimum <= value <= maximum):
         raise _FieldError(f"{key} must be between {minimum} and {maximum}, got {value}")
     return value
+
+
+def _parse_bool(raw: str | None, key: str, default: bool) -> bool:
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in _TRUE_LITERALS:
+        return True
+    if value in _FALSE_LITERALS:
+        return False
+    raise _FieldError(
+        f"{key} must be one of {sorted(_TRUE_LITERALS | _FALSE_LITERALS)}, got {raw!r}"
+    )
 
 
 def _parse_log_level(raw: str | None) -> str:
