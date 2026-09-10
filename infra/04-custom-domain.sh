@@ -79,7 +79,30 @@ aws lambda add-permission --function-name "$FN" \
 echo "→ MCP_ALLOWED_HOSTS 에 $API.execute-api.$REGION.amazonaws.com 과 $DOMAIN 추가 (환경변수 전체 교체 주의)"
 
 # ---------------------------------------------------------------------------
-# 4~6 단계는 **도메인 소유자의 DNS 작업에 블록된다**
+# 4~6 단계 — 실제로 이렇게 완료했다 (2026-09-10)
+#
+# 결과: https://mcp.devoks.kr/mcp 라이브. TLS 1.3 / CN=mcp.devoks.kr /
+# Amazon RSA 2048 M04 / 만료 2027-03-26 / 자동 갱신.
+#
+# ACM 검증이 오래 PENDING 일 때 — 기다리기만 하지 말고 좁혀라:
+#   ① CAA 레코드 확인 (dig CAA <도메인>). 있으면 amazon.com 이 포함돼야 한다.
+#   ② 기대값 대 실제값을 **문자 단위로** 비교하라. dig +short CNAME <레코드명>
+#      의 결과가 ResourceRecord.Value 와 완전히 같아야 한다(트레일링 점은
+#      FQDN 표기라 정상이다 — 실측 확인).
+#   ③ FailureReason 필드를 보라. null 이면 실패가 아니라 폴링 대기다.
+#   ④ 위가 전부 정상이면 ACM 백오프다. 검증 CNAME 은 **같은 도메인·계정에서
+#      결정적**이므로(실측 확인), 새 인증서를 요청하면 이미 추가된 레코드로
+#      즉시 폴링을 시작한다. 둘 중 먼저 발급된 것을 쓰고 나머지는 삭제하면
+#      된다(공인 인증서는 무료).
+#
+# ⚠️ 라이브 검증 전에 **배포된 이미지 태그를 먼저 확인하라.**
+#    도메인 검증 직후 감사 로그에 TASK-049 의 신규 reason_code 가 없었는데,
+#    원인은 함수가 구버전 이미지로 돌고 있었던 것이다(CI 배포 스텝은 기본
+#    브랜치 전용). "코드를 고쳤다"와 "고친 코드가 돌고 있다"는 별개다.
+#      aws lambda get-function --function-name devoks-mcp-management \
+#        --query Code.ImageUri --output text
+# ---------------------------------------------------------------------------
+# (원래 계획 — 사람 작업이 필요한 지점)
 #
 #   4. (사람) 가비아에서 DNS 관리를 활성화하고 위 검증 CNAME 을 추가한다.
 #      2026-09-10 확인 시점에 devoks.kr 은 NS·SOA 가 없었다 — 도메인만 등록돼
