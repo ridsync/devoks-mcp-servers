@@ -115,7 +115,7 @@ def main() -> int:
             vuln_id = vuln.get("id", "?")
             try:
                 fixes = fixed_versions(vuln_id)
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+            except urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError:
                 fixes = []
             line = f"{name}=={version}  {vuln_id}"
             if fixes:
