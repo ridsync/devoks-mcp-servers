@@ -255,6 +255,30 @@ jobs:
       # `push` events only: a pull_request run would publish a duplicate of a
       # commit that is already being built on its branch, and fork PRs cannot
       # get an OIDC token with these permissions anyway.
+      # TEMPORARY diagnostic (remove once OIDC is confirmed working).
+      # Prints only the non-secret claims of the OIDC token - sub/aud/iss and
+      # the repo/ref it names - never the signature. These claims are the
+      # ground truth an IAM trust policy has to match, so measuring them beats
+      # guessing at why AssumeRoleWithWebIdentity was refused.
+      - name: Diagnose OIDC claims
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          cat > /tmp/claims.py <<'EOF'
+          import base64, json, os, urllib.request
+          req = urllib.request.Request(
+              os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=sts.amazonaws.com",
+              headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]},
+          )
+          token = json.load(urllib.request.urlopen(req))["value"]
+          part = token.split(".")[1]
+          part += "=" * (-len(part) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(part))
+          for k in ("iss", "aud", "sub", "repository", "repository_owner", "ref", "event_name"):
+              print("  %-18s = %r" % (k, claims.get(k)))
+          EOF
+          python3 /tmp/claims.py
+
       - name: Configure AWS credentials (OIDC)
         if: github.event_name == 'push'
         uses: aws-actions/configure-aws-credentials@v6 # verified via GitHub API: v6 tag exists (latest v6.2.4)
