@@ -34,6 +34,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ContentBlock, TextContent
 
+from conftest import make_settings
 from devoks_mcp_management.adapters.knowledge.github.client import (
     FileContent,
     GitHubClient,
@@ -72,22 +73,9 @@ def _settings(
 ) -> Settings:
     # Direct dataclass construction -- same pattern as test_guard.py/test_server.py
     # for modules that never touch github_app_private_key/client_tokens content.
-    return Settings(
-        allowed_hosts=("mcp.example.com",),
-        public_url="https://mcp.example.com/mcp",
-        issuer_url="https://issuer.example.com",
+    return make_settings(
         repo_allowlist=repo_allowlist,
         role_tools=role_tools if role_tools is not None else {READER_ROLE: ALL_FOUR_TOOLS},
-        github_app_id="app-id",
-        github_app_installation_id="install-id",
-        port=8000,
-        log_level="INFO",
-        read_file_max_bytes=262_144,
-        search_code_max_results=30,
-        token_refresh_leeway_seconds=300,
-        stateless_http=True,
-        json_response=True,
-        client_tokens={},
         github_app_private_key="unused-in-tools-wiring-tests",
     )
 

@@ -192,7 +192,19 @@ jobs:
           export MCP_ALLOWED_HOSTS="localhost"
           export MCP_PUBLIC_URL="https://ci.example.com/mcp"
           export MCP_ISSUER_URL="https://ci.example.com"
-          export MCP_CLIENT_TOKENS='{"smoke-token":{"client_id":"ci-smoke","role":"reader","scopes":["devoks:read"]}}'
+          # Generated per run, never a literal (TASK-046). Two reasons:
+          #   1. config.py now enforces a 32-character floor on
+          #      MCP_CLIENT_TOKENS keys, and the previous literal
+          #      "smoke-token" (11 chars) would fail startup.
+          #   2. More importantly, a token literal committed to a workflow
+          #      file is a published credential the moment anyone copies it
+          #      forward into a real deployment — which is exactly how the
+          #      deployed Lambda ended up running with .env.example's
+          #      placeholder token. The same reasoning as the openssl-generated
+          #      PEM above: CI needs a *valid-shaped* credential, never a
+          #      *reusable* one.
+          CI_SMOKE_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          export MCP_CLIENT_TOKENS="{\"$CI_SMOKE_TOKEN\":{\"client_id\":\"ci-smoke\",\"role\":\"reader\",\"scopes\":[\"devoks:read\"]}}"
           export MCP_ROLE_TOOLS='{"reader":["list_repos","get_repo_tree","read_file","search_code"]}'
           export GITHUB_APP_ID="000000000"
           GITHUB_APP_PRIVATE_KEY="$(cat /tmp/ci-smoke-key.pem)"

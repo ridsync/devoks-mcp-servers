@@ -17,4 +17,14 @@ build/
 .pyright/
 
 # Secrets (see .env.example for the tracked template)
+#
+# `.env.*` (not just `.env`) because a rotation/backup file such as
+# `.env.bak.20260910-150457` is *untracked but not ignored*, which means it
+# shows up as `??` in `git status` and a single `git add .` commits a live
+# GitHub App private key to what is currently a PUBLIC repository. Caught as
+# a near-miss during TASK-046; git history was verified clean at that point
+# (`git log --all --name-only` had no `.env`/`.env.bak` entry).
+# The negation keeps the one file that is *meant* to be tracked.
 .env
+.env.*
+!.env.example

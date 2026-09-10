@@ -144,7 +144,13 @@ from devoks_mcp_management.audit.logger import emit as _default_emit
 from devoks_mcp_management.auth.policy import authorize
 from devoks_mcp_management.auth.verifier import get_role
 from devoks_mcp_management.config import Settings
-from devoks_mcp_management.types import AUDIT_EVENT_TOOL_CALL, AuditOutcome, AuditRecord
+from devoks_mcp_management.types import (
+    AUDIT_EVENT_TOOL_CALL,
+    AuditOutcome,
+    AuditRecord,
+    SecurityBoundaryError,
+    SecurityReasonCode,
+)
 
 __all__ = ["make_tool_guard"]
 
@@ -176,6 +182,24 @@ _NO_IDENTITY_REASON_CODE = "no_identity"
 #: ``role_unknown`` deny branch — used both when there is no identity at all
 #: and when an ``AccessToken`` carries no role claim.
 _UNKNOWN_ROLE_SENTINEL = ""
+
+#: Stands in for a named ``repo_arg`` that arrived as something other than a
+#: ``str`` (TASK-045). It must be non-``None`` and must never be an element
+#: of ``repo_allowlist``: ``authorize()`` skips the repo check entirely when
+#: ``repo is None``, so returning ``None`` for a malformed argument was
+#: **fail-open** — ``read_file(repo=123, ...)`` was authorized without the
+#: ``CTR-008`` allowlist check ever running, and the audit record showed no
+#: denial. The ``\x00`` prefix guarantees non-membership: ``config.py``'s
+#: ``_REPO_ALLOWLIST_ENTRY`` only admits ``owner/repo`` spellings, so no
+#: configured entry can contain a null byte. The resulting decision is
+#: ``denied`` / ``repo_not_allowlisted``, which is also the truthful
+#: classification — a non-string repository is not on the allowlist.
+#:
+#: In practice the MCP SDK validates tool arguments against the tool's
+#: signature before the guard runs (a wrong-typed ``repo`` is rejected as a
+#: pydantic validation error), so this is defense in depth for the case where
+#: that layer changes or is bypassed — not a currently reachable path.
+_MALFORMED_REPO_SENTINEL = "\x00-repo-arg-was-not-a-string"
 
 
 def _default_timestamp() -> str:
@@ -306,8 +330,47 @@ def make_tool_guard(
 
                 outcome: AuditOutcome = "ok"
                 error_kind: str | None = None
+                # TASK-049: set only by the SecurityBoundaryError clause and
+                # read by the `finally` block below, which is the single
+                # emit site for this call. Adding a second `record()` inside
+                # an `except` would emit *two* audit lines for one tool call.
+                security_reason_code: SecurityReasonCode | None = None
                 try:
                     result = await fn(*args, **kwargs)
+                except SecurityBoundaryError as exc:
+                    # TASK-049. Must precede the general ToolError clause
+                    # below — SecurityBoundaryError *is* a ToolError, so a
+                    # broader clause placed first would swallow it and the
+                    # record would go back to `error`/`ToolError`.
+                    #
+                    # Classified `denied`, not `error`, because that is the
+                    # bucket an operator queries when asking "is anyone
+                    # probing our boundaries?". Every other boundary refusal
+                    # (`repo_not_allowlisted`, `tool_not_permitted`) already
+                    # lands there; leaving allowlist-escape attempts in
+                    # `error` put them next to "file not found" and "rate
+                    # limited", where they are indistinguishable from noise.
+                    #
+                    # Re-raised unchanged (not converted): the exception is
+                    # already a client-safe ToolError whose message names only
+                    # the violated rule, so the caller sees exactly what it
+                    # saw before this task — AC-003-5's "every denial looks
+                    # identical to the caller" is preserved while the audit
+                    # line gains a queryable reason_code.
+                    #
+                    # `error_kind` stays None: this is a refusal, not a
+                    # failure, and CTR-003 keeps the two fields separate
+                    # precisely so a log query can tell them apart without
+                    # parsing values.
+                    outcome = "denied"
+                    security_reason_code = exc.reason_code
+                    logger.warning(
+                        "Tool %r rejected a security-boundary violation (%s): %s",
+                        tool,
+                        exc.reason_code,
+                        exc,
+                    )
+                    raise
                 except (ToolError, ResourceError, MCPError) as exc:
                     # Deliberate, already client-safe (SDK contract) —
                     # audited, then passed through unchanged so a
@@ -337,6 +400,7 @@ def make_tool_guard(
                         outcome=outcome,
                         client_id=client_id,
                         role=effective_role,
+                        reason_code=security_reason_code,
                         error_kind=error_kind,
                     )
 
@@ -348,11 +412,35 @@ def make_tool_guard(
 
 
 def _extract_str_arg(arguments: Mapping[str, Any], name: str | None) -> str | None:
-    """Read the tool's designated repo argument (see module docstring: named, never inferred)."""
+    """Read the tool's designated repo argument (see module docstring: named, never inferred).
+
+    Three distinct outcomes, deliberately not collapsed (TASK-045):
+
+    - ``name is None`` — the tool declared no repo argument, so there is no
+      repository to authorize. ``None`` here means "skip the repo check",
+      which is correct.
+    - the argument is a ``str`` — returned as-is for ``authorize()`` to check
+      against ``CTR-008``.
+    - the argument is present but **not** a ``str`` — returns
+      ``_MALFORMED_REPO_SENTINEL`` so the repo check still runs and denies,
+      instead of ``None``, which would have skipped it (fail-open).
+    """
     if name is None:
         return None
-    value = arguments.get(name)
-    return value if isinstance(value, str) else None
+    if name not in arguments:
+        # The tool names a repo argument but this call did not bind one at
+        # all; there is nothing to check against the allowlist. Distinct
+        # from "bound to a non-string", which is a malformed call.
+        return None
+    value = arguments[name]
+    if isinstance(value, str):
+        return value
+    if value is None:
+        # An explicitly optional repo argument left unset — same meaning as
+        # not bound (``bind_partial().apply_defaults()`` binds omitted
+        # parameters to ``None``).
+        return None
+    return _MALFORMED_REPO_SENTINEL
 
 
 def _build_args_summary(arguments: Mapping[str, Any], names: tuple[str, ...]) -> dict[str, str]:

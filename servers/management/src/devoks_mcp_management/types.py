@@ -10,6 +10,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Final, Literal
 
+from mcp.server.mcpserver.exceptions import ToolError
+
 # --- Tool names (CTR-007 role/tool mapping keys) ----------------------------
 
 TOOL_LIST_REPOS: Final = "list_repos"
@@ -36,6 +38,53 @@ CORE_GITHUB_TOOLS: Final[frozenset[str]] = frozenset(
 AuditOutcome = Literal["ok", "denied", "error"]
 
 AUDIT_EVENT_TOOL_CALL: Final = "tool_call"
+
+
+# --- Security-boundary rejections (TASK-049) ---------------------------------
+
+#: Audit ``reason_code`` values for a tool argument that tried to cross a
+#: security boundary, as opposed to ``auth.policy.ReasonCode``'s values, which
+#: describe an authorization decision made *before* the body ran.
+SecurityReasonCode = Literal["path_traversal_attempt", "query_qualifier_injection"]
+
+
+class SecurityBoundaryError(ToolError):
+    """A tool argument was rejected for trying to cross a security boundary.
+
+    Why this exists at all — the observability gap it closes
+    ---------------------------------------------------------
+    ``EDGE-013`` (path traversal) and ``EDGE-014`` (search-qualifier
+    injection) are validated inside ``adapters.knowledge.github.client``,
+    deep in the tool body, while the audit record is written by
+    ``tools.guard``'s wrapper. Both rejections therefore surfaced to the
+    audit log the same way any other input error does: ``outcome="error"``
+    with ``error_kind="ToolError"``.
+
+    That is technically accurate and operationally useless. An operator
+    hunting for "someone is probing our allowlist" looks at
+    ``outcome="denied"`` — that is where every other boundary refusal lands
+    (``repo_not_allowlisted`` and friends). An allowlist-escape attempt
+    sitting in the ``error`` bucket next to "file not found" and "rate
+    limited" is indistinguishable from ordinary noise. Confirmed against the
+    deployed server's real CloudWatch records before this class was written:
+    traversal and injection attempts appeared as
+    ``outcome=error error_kind=ToolError``.
+
+    Why a ``ToolError`` *subclass*
+    -------------------------------
+    Subclassing keeps the caller's experience byte-identical. ``guard``
+    already passes ``ToolError`` through unchanged so a tool's own message
+    reaches the model verbatim, and ``AC-003-5`` requires denials to be
+    indistinguishable to the caller. Only the audit classification changes:
+    ``guard`` catches this type *before* the general ``ToolError`` clause,
+    records ``outcome="denied"`` with ``reason_code``, then re-raises the
+    same exception. A caller sees the same string it saw before; an operator
+    gets a queryable signal.
+    """
+
+    def __init__(self, message: str, *, reason_code: SecurityReasonCode) -> None:
+        super().__init__(message)
+        self.reason_code: SecurityReasonCode = reason_code
 
 
 @dataclass(frozen=True, slots=True)

@@ -13,6 +13,7 @@ from mcp.client import Client
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 
+from conftest import make_settings
 from devoks_mcp_management import server as server_module
 from devoks_mcp_management.auth.verifier import StaticTableTokenVerifier
 from devoks_mcp_management.config import Settings
@@ -29,24 +30,10 @@ def _settings(
     # already uses), not `load_settings` — this module never touches
     # `github_app_private_key`/`client_tokens` content, so no PEM fixture is
     # needed here (unlike `test_config.py`, which validates the real key).
-    return Settings(
-        allowed_hosts=("mcp.example.com",),
+    return make_settings(
         public_url=public_url,
         issuer_url=issuer_url,
-        repo_allowlist=frozenset({"ridsync/devoks-mcp-servers"}),
-        role_tools=role_tools
-        if role_tools is not None
-        else {"reader": frozenset({"list_repos", "get_repo_tree", "read_file", "search_code"})},
-        github_app_id="app-id",
-        github_app_installation_id="install-id",
-        port=8000,
-        log_level="INFO",
-        read_file_max_bytes=262_144,
-        search_code_max_results=30,
-        token_refresh_leeway_seconds=300,
-        stateless_http=True,
-        json_response=True,
-        client_tokens={},
+        role_tools=role_tools,
         github_app_private_key="unused-in-server-tests",
     )
 

@@ -57,6 +57,25 @@ scan with a constant-time compare per row removes that variable entirely.
 The token table for this deployment is a handful of internal service
 clients (Stage 1, FRD §6.4) — O(n) here is a handful of ``compare_digest``
 calls per request, not a scaling concern.
+
+Why the comparison is done on ``bytes`` (TASK-043)
+----------------------------------------------------
+``secrets.compare_digest`` accepts two ``str`` **only if both contain
+nothing but ASCII**; given a non-ASCII ``str`` it raises
+``TypeError: comparing strings with non-ASCII characters is not supported``
+(reproduced locally, not inferred). A ``str`` token arrives here straight
+from the ``Authorization`` header, so any client sending
+``Authorization: Bearer 토큰`` — a paste accident is enough — turned an
+ordinary "unregistered token" into an unhandled exception: HTTP **500 with a
+traceback** instead of the **401** ``AC-002-2`` requires, and an
+``error``-classified server log instead of a quiet auth failure.
+
+Both sides are therefore compared as UTF-8 ``bytes``. The table rows are
+encoded once in ``__init__`` rather than on every request, so the per-request
+cost is one ``str.encode`` for the presented token. ``compare_digest`` on
+``bytes`` has no ASCII restriction, which makes ``verify_token``'s "never
+raises" docstring true for *any* input rather than only for well-behaved
+input.
 """
 
 import secrets
@@ -89,6 +108,13 @@ class StaticTableTokenVerifier:
         of the environment).
         """
         self._client_tokens = client_tokens
+        # Encoded once here, not per request (TASK-043 — see module
+        # docstring). Snapshotting is safe: ``Settings`` is a frozen
+        # dataclass and its token table is never mutated after
+        # ``load_settings`` builds it.
+        self._encoded_rows: tuple[tuple[bytes, ClientToken], ...] = tuple(
+            (candidate.encode("utf-8"), entry) for candidate, entry in client_tokens.items()
+        )
 
     @classmethod
     def from_settings(cls, settings: Settings) -> StaticTableTokenVerifier:
@@ -103,12 +129,18 @@ class StaticTableTokenVerifier:
         typo, a revoked credential), not an error condition worth
         surfacing beyond the SDK's own 401 (AC-002-2, handled by the SDK,
         not here).
+
+        "Never raises" holds for **any** ``str``, including non-ASCII: the
+        comparison runs on UTF-8 ``bytes`` precisely so that a token like
+        ``"토큰"`` is an ordinary 401 rather than a 500 (TASK-043 — see the
+        module docstring for the reproduction).
         """
+        presented = token.encode("utf-8")
         matched: ClientToken | None = None
         # Constant-total-time scan (see module docstring): every row is
         # compared, the loop never exits early on a hit.
-        for candidate, entry in self._client_tokens.items():
-            if secrets.compare_digest(candidate, token):
+        for candidate, entry in self._encoded_rows:
+            if secrets.compare_digest(candidate, presented):
                 matched = entry
         if matched is None:
             return None

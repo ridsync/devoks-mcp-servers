@@ -70,6 +70,32 @@ _REPO_ALLOWLIST_ENTRY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _ENV_READ_FILE_MAX_BYTES = "MCP_READ_FILE_MAX_BYTES"
 _ENV_SEARCH_CODE_MAX_RESULTS = "MCP_SEARCH_CODE_MAX_RESULTS"
 _ENV_TOKEN_REFRESH_LEEWAY_SECONDS = "MCP_TOKEN_REFRESH_LEEWAY_SECONDS"
+#: Minimum length for a `MCP_CLIENT_TOKENS` key (TASK-046).
+#:
+#: WHY THIS VALIDATION EXISTS — a real incident, not a hypothetical:
+#: the deployed Lambda was found running with the bearer token
+#: `dev-local-token-change-me`, which is the literal placeholder published in
+#: this repository's own tracked `.env.example`. The repository is public and
+#: the Function URL had been written into a commit message, so the service
+#: was effectively open to the internet. Access logs showed no third-party
+#: IP, so nothing was exfiltrated, but the exposure was real.
+#:
+#: The root cause is structural, and it is worth naming precisely: the
+#: `GITHUB_APP_PRIVATE_KEY` placeholder in `.env.example` is **invalid on
+#: purpose** — `_parse_private_key` rejects it, so a deployment that forgot
+#: to replace it fails to start. The token placeholder had no such property:
+#: it was a perfectly valid token table, so copying `.env.example` forward
+#: produced a *working* server with a *published* credential and no signal
+#: at all.
+#:
+#: 32 characters is the floor rather than a specific format because CTR-002
+#: does not constrain token shape. `secrets.token_urlsafe(32)` yields 43
+#: characters / 256 bits, comfortably above it; anything a human types by
+#: hand falls below it. Paired with a `.env.example` placeholder that is now
+#: deliberately **too short to pass**, the placeholder can no longer reach
+#: production silently.
+_MIN_CLIENT_TOKEN_LENGTH = 32
+
 _ENV_STATELESS_HTTP = "MCP_STATELESS_HTTP"
 _ENV_JSON_RESPONSE = "MCP_JSON_RESPONSE"
 
@@ -400,6 +426,16 @@ def _parse_client_tokens(raw: str) -> Mapping[str, ClientToken]:
     for index, (token, entry) in enumerate(data.items(), start=1):
         if not token:
             problems.append(f"MCP_CLIENT_TOKENS entry #{index}: key must be a non-empty string")
+            continue
+        if len(token) < _MIN_CLIENT_TOKEN_LENGTH:
+            # The length is reported, the token is not — this message can end
+            # up in logs, and a too-short token is still a credential.
+            problems.append(
+                f"MCP_CLIENT_TOKENS entry #{index}: token must be at least "
+                f"{_MIN_CLIENT_TOKEN_LENGTH} characters, got {len(token)}. "
+                "Generate one with: python3 -c "
+                "'import secrets; print(secrets.token_urlsafe(32))'"
+            )
             continue
         if not isinstance(entry, dict):
             problems.append(f"MCP_CLIENT_TOKENS entry #{index}: value must be an object")

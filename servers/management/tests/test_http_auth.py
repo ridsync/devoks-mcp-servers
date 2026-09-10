@@ -29,14 +29,15 @@ from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from starlette.applications import Starlette
 
+from conftest import make_settings
 from devoks_mcp_management.app import create_app
 from devoks_mcp_management.config import ClientToken, Settings
 from devoks_mcp_management.server import REQUIRED_SCOPES, SERVER_NAME
 
 _ALLOWED_HOST = "mcp.example.com"
 _PUBLIC_URL = "https://mcp.example.com/mcp"
-_VALID_TOKEN = "secret-token"  # noqa: S105 -- test fixture literal, not a real credential
-_NO_SCOPE_TOKEN = "no-scope-token"  # noqa: S105 -- test fixture literal, not a real credential
+_VALID_TOKEN = "test-fixture-token-not-a-real-credential"  # noqa: S105
+_NO_SCOPE_TOKEN = "test-fixture-token-without-any-scopes-xx"  # noqa: S105
 
 
 def _settings(
@@ -51,27 +52,12 @@ def _settings(
     # from test_app.py (test modules don't import each other) or extracted
     # to conftest.py -- see the handover notes for why extraction was
     # skipped for this task.
-    return Settings(
-        allowed_hosts=(_ALLOWED_HOST,),
-        public_url=_PUBLIC_URL,
-        issuer_url="https://issuer.example.com",
-        repo_allowlist=frozenset({"ridsync/devoks-mcp-servers"}),
-        role_tools={
-            "reader": frozenset({"list_repos", "get_repo_tree", "read_file", "search_code"})
-        },
-        github_app_id="app-id",
-        github_app_installation_id="install-id",
-        port=8000,
-        log_level="INFO",
-        read_file_max_bytes=262_144,
-        search_code_max_results=30,
-        token_refresh_leeway_seconds=300,
+    return make_settings(
         stateless_http=stateless_http,
         json_response=json_response,
         client_tokens=client_tokens
         if client_tokens is not None
         else {_VALID_TOKEN: ClientToken(client_id="c1", role="reader", scopes=("devoks:read",))},
-        github_app_private_key="unused-in-app-tests",
     )
 
 

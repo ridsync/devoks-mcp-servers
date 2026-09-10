@@ -24,6 +24,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from devoks_mcp_management.adapters.knowledge.github.client import GitHubClient
 from devoks_mcp_management.adapters.knowledge.github.credentials import InstallationTokenError
+from devoks_mcp_management.types import SecurityBoundaryError
 
 DEFAULT_MAX_BYTES = 262_144
 DEFAULT_MAX_RESULTS = 30
@@ -1394,3 +1395,74 @@ async def test_search_code_filters_out_allowlist_violating_results_returned_by_g
     assert [item.path for item in results.items] == ["src/a.py"]
     assert results.total_count == 3  # GitHub's own count is left uncapped/unfiltered
     await http.aclose()
+
+
+# --- EDGE-014 companion: the `repo` parameter is an injection surface too ------
+
+
+@pytest.mark.parametrize(
+    "repo",
+    [
+        "victim/x OR repo:secret",  # the actual reproduction
+        "victim/x:y",  # colon starts a qualifier
+        "victim/x y",  # whitespace separates qualifiers
+        "a/b/c",  # a second slash is not an owner/repo name
+        "acme/widgets NOT repo:other",
+        "",  # empty
+    ],
+)
+async def test_search_code_rejects_a_repo_that_is_not_a_plain_owner_repo_name(
+    repo: str,
+) -> None:
+    """`repo` is interpolated straight into `q=repo:{repo} {query}`.
+
+    Found while verifying TASK-049 end to end: `_split_repo` is deliberately
+    loose (non-empty owner and name is all it requires), so
+    `"victim/x OR repo:secret"` split happily and reached GitHub as *two*
+    qualifiers — the same boundary escape `EDGE-014` closes on the `query`
+    side, through a different parameter.
+
+    Not reachable through the MCP surface today, because `tools/guard.py`
+    authorizes this argument against `CTR-008`'s exact-membership allowlist
+    and `config.py` only admits `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$` entries.
+    Asserted here anyway so `GitHubClient` is safe to call directly rather
+    than inheriting its safety from whichever caller wraps it — the same
+    reason `EDGE-013` keeps two independent layers.
+    """
+    transport = _RecordingTransport()
+    client, http, _ = _client(transport)
+
+    with pytest.raises(SecurityBoundaryError) as excinfo:
+        await client.search_code("safe", repo)
+
+    assert excinfo.value.reason_code == "query_qualifier_injection"
+    assert transport.call_count == 0
+    # The message must not echo the rejected value back (same contract as
+    # auth.policy's denial messages).
+    assert repo not in str(excinfo.value) or repo == ""
+    await http.aclose()
+
+
+async def test_search_code_accepts_a_plain_owner_repo_name() -> None:
+    """The new check must not reject legitimate repository names.
+
+    Dots, hyphens and underscores are all valid in GitHub owner/repo names,
+    so a check that only allowed `[A-Za-z0-9]` would break real callers.
+    """
+    for repo in ["acme/widgets", "acme-org/my_repo.v2", "a/b"]:
+        transport = _RecordingTransport(
+            [httpx2.Response(200, json={"total_count": 0, "items": []})]
+        )
+        client, http, _ = _client(transport, repo_allowlist=frozenset({repo}))
+
+        result = await client.search_code("safe", repo)
+
+        assert result.items == ()
+        # The request actually went out — proving the check let it through
+        # rather than the assertion above passing on an empty short-circuit.
+        assert transport.call_count == 1
+        # `url.params` decodes percent-encoding; the raw URL string shows
+        # `repo%3Aacme%2Fwidgets`, which would make a substring check on it
+        # silently vacuous.
+        assert transport.requests[0].url.params["q"] == f"repo:{repo} safe"
+        await http.aclose()
