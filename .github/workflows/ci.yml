@@ -123,8 +123,16 @@ jobs:
       # would produce a permanently red pipeline that everyone learns to
       # ignore. See the script's own docstring for the full rationale and for
       # why it exits 2 rather than 0 when the audit itself cannot run.
+      #
+      # `uv run python`, not the runner's `python3`: ruff formats this
+      # repository for its Python 3.14 target, which means PEP 758's
+      # parenthesis-free multi-exception `except` — and ubuntu-latest's system
+      # python3 is 3.12, where that is a SyntaxError. Caught by this very step
+      # failing on its first CI run. Same hard-floor trap the Dockerfile
+      # documents for the container base image; any script in this repository
+      # must run on the project interpreter, never the ambient one.
       - name: Audit dependencies (OSV)
-        run: python3 scripts/audit-dependencies.py
+        run: uv run python scripts/audit-dependencies.py
 
   docker:
     name: Docker build (arm64) + /healthz smoke + ECR push
