@@ -17,6 +17,27 @@ PROFILE="${AWS_PROFILE:-devoks}"
 REGION="${AWS_REGION:-ap-northeast-2}"
 ACCOUNT_ID="$(aws sts get-caller-identity --profile "$PROFILE" --query Account --output text)"
 GITHUB_REPO="${GITHUB_REPO:-ridsync/devoks-mcp-servers}"
+
+# GitHub's OIDC `sub` claim carries immutable owner and repository IDs for any
+# repository created after 2026-07-15 (and for any repo renamed or transferred
+# after that date):
+#
+#   repo:OWNER@OWNER_ID/REPO@REPO_ID:ref:refs/heads/BRANCH
+#
+# NOT the `repo:OWNER/REPO:ref:...` form that AWS's docs and essentially every
+# blog post still show. A trust policy written against the old shape is
+# refused with "Not authorized to perform sts:AssumeRoleWithWebIdentity" and
+# nothing in that message hints at why. Note the delimiter is `@`; GitHub's own
+# docs briefly described it as `-`.
+#
+# Matching on the IDs rather than the names is the point of the feature: the
+# policy keeps working through a rename or transfer, because IDs do not move.
+# See https://github.blog/changelog/2026-04-23-immutable-subject-claims-for-github-actions-oidc-tokens/
+REPO_ID="$(gh api "repos/${GITHUB_REPO}" --jq .id)"
+OWNER_ID="$(gh api "repos/${GITHUB_REPO}" --jq .owner.id)"
+OWNER_NAME="${GITHUB_REPO%%/*}"
+REPO_NAME="${GITHUB_REPO##*/}"
+OIDC_SUBJECT="repo:${OWNER_NAME}@${OWNER_ID}/${REPO_NAME}@${REPO_ID}:*"
 ECR_REPO="devoks-mcp-management"
 ROLE_NAME="devoks-mcp-github-actions"
 TAGS="Key=Project,Value=devoks-mcp Key=Stage,Value=stage2 Key=ManagedBy,Value=infra-script"
@@ -65,11 +86,22 @@ THUMBPRINT="$(
   | openssl x509 -noout -fingerprint -sha1 \
   | sed 's/.*=//' | tr -d ':' | tr 'A-Z' 'a-z'
 )"
+ROOT_THUMBPRINT="$(
+  openssl s_client -servername token.actions.githubusercontent.com \
+    -showcerts -connect token.actions.githubusercontent.com:443 </dev/null 2>/dev/null \
+  | awk '/-----BEGIN CERTIFICATE-----/{n++} n==3' \
+  | openssl x509 -noout -fingerprint -sha1 \
+  | sed 's/.*=//' | tr -d ':' | tr 'A-Z' 'a-z'
+)"
 echo "  intermediate CA sha1: $THUMBPRINT"
+echo "  root CA sha1        : $ROOT_THUMBPRINT"
+# Both registered: AWS no longer validates thumbprints for IdPs backed by a
+# trusted root, but the API still requires the field, and Let's Encrypt serves
+# different chains to different clients - so pinning only one is a coin flip.
 aws iam create-open-id-connect-provider \
   --url https://token.actions.githubusercontent.com \
   --client-id-list sts.amazonaws.com \
-  --thumbprint-list "$THUMBPRINT" \
+  --thumbprint-list "$THUMBPRINT" "$ROOT_THUMBPRINT" \
   --tags Key=Project,Value=devoks-mcp \
   --query OpenIDConnectProviderArn --output text || echo "  (already exists)"
 
@@ -89,7 +121,7 @@ aws iam create-role \
       \"Action\": \"sts:AssumeRoleWithWebIdentity\",
       \"Condition\": {
         \"StringEquals\": { \"token.actions.githubusercontent.com:aud\": \"sts.amazonaws.com\" },
-        \"StringLike\":   { \"token.actions.githubusercontent.com:sub\": \"repo:${GITHUB_REPO}:*\" }
+        \"StringLike\":   { \"token.actions.githubusercontent.com:sub\": \"${OIDC_SUBJECT}\" }
       }
     }]
   }" --query Role.Arn --output text || echo "  (already exists)"
@@ -118,6 +150,7 @@ say "Done"
 cat <<EOF
   ECR URI  : ${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}
   Role ARN : arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}
+  OIDC sub : ${OIDC_SUBJECT}
 
   Put these in .github/workflows/ci.yml (they are identifiers, not secrets).
 EOF
