@@ -228,7 +228,13 @@ Function URL: `https://zhruzqvcl52iprokp3j63ytiu40smiel.lambda-url.ap-northeast-
 - **콜드스타트 실측 → `EDGE-016` 정정** — 새 이미지 첫 1회 **8,511 ms**(이미지 최적화 일회성), 이후 **~1,900 ms**. 메모리 증설은 무효(512/1024/1769 MB에서 1,923/2,007/1,877 ms). `Max Memory Used` 116 MB → 512 MB 유지가 측정 근거 있는 선택. 웜 호출은 2~4 ms
 - **겪은 함정 2개를 `EDGE-020`·`EDGE-021`로 기록** — Function URL 403의 원인이 권한 statement **2개** 필요(`InvokeFunctionUrl` + `InvokeFunction`)였고, 환경변수 총량 4 KB 한계가 PEM 크기와 맞물린다
 
-- [ ] `TASK-060` **[Medium]** 커스텀 도메인 `mcp.devoks.kr` — **API Gateway HTTP API**(CloudFront 아님, 근거 FRD §7·§10 Step 7). ACM 인증서(`ap-northeast-2`) + HTTP API + Lambda 프록시 통합 + 커스텀 도메인 + 가비아 CNAME 2건(ACM 검증 underscore, `mcp` → 리전 엔드포인트). 완료 후 `MCP_PUBLIC_URL`·`MCP_ALLOWED_HOSTS` 전환 — file: `infra/04-custom-domain.sh` / traces: `CTR-001`, `EDGE-018`, `EDGE-019`
+- [~] `TASK-060` **[Medium]** 커스텀 도메인 `mcp.devoks.kr` — **API Gateway HTTP API**(CloudFront 아님, 근거 FRD §7·§10 Step 7). ACM 인증서(`ap-northeast-2`) + HTTP API + Lambda 프록시 통합 + 커스텀 도메인 + 가비아 CNAME 2건(ACM 검증 underscore, `mcp` → 리전 엔드포인트). 완료 후 `MCP_PUBLIC_URL`·`MCP_ALLOWED_HOSTS` 전환 — file: `infra/04-custom-domain.sh` / traces: `CTR-001`, `EDGE-018`, `EDGE-019`
+  - **AWS 측은 완료, DNS 작업에 블록됨(2026-09-10).** 만든 것: ACM 인증서 `arn:...certificate/64892b2a-e986-4b7d-9154-6f3fb8b797be`(`PENDING_VALIDATION`), HTTP API `jd2r2h5esk`(Lambda 프록시 통합, `$default` 라우트·스테이지, AutoDeploy), API Gateway용 Lambda 호출 권한, `MCP_ALLOWED_HOSTS`에 세 진입점 등록. 재현 스크립트 `infra/04-custom-domain.sh`.
+  - **⚠️ `devoks.kr`에 네임서버가 없다** — `dig NS/SOA devoks.kr` 모두 공백이다(오늘 등록됨). 도메인은 등록됐지만 DNS 존이 서비스되지 않는 상태이므로 **어떤 CNAME도 해석되지 않고 ACM 검증이 영구히 PENDING**이다. 가비아에서 DNS 관리를 먼저 활성화해야 한다.
+  - **⚠️ `create-api --target`은 Lambda 호출 권한을 추가하지 않는다**(실측). `add-permission`을 별도로 해야 하며, 없으면 API Gateway가 500을 반환한다. `infra/04-custom-domain.sh`에 기록했다.
+  - **API Gateway 경로는 도메인 없이 이미 전수 검증됐다** — 기본 엔드포인트 `https://jd2r2h5esk.execute-api.ap-northeast-2.amazonaws.com`로: `/healthz` 200 / 무인증 `POST /mcp` → **401(421이 아님 = `Host`가 그대로 도착해 검증을 통과했다는 증거)** / `Authorization` 헤더가 정책 설정 없이 전달됨 → `initialize`(69 ms) → `tools/list` 4툴 → `list_repos` 실호출(1,028 ms) → `read_file` 성공. **CloudFront 대신 API Gateway를 고른 근거가 실측으로 확인됐다.**
+  - **`EDGE-018`의 근거가 굳었다** — `get-integrations` 실측 `TimeoutInMillis: 30000`. 이것이 `_GITHUB_HTTP_TIMEOUT_SECONDS`를 20초로 낮춘 이유다.
+  - **남은 사람 작업 2건**: ① 가비아 DNS 활성화 + ACM 검증 CNAME 추가 ② 인증서 발급 후 커스텀 도메인 생성(스크립트 5단계) → 나오는 `RegionalDomainName`으로 `mcp` CNAME 추가. 그 뒤 `MCP_PUBLIC_URL`·`MCP_ISSUER_URL` 전환(도메인이 실제로 응답하기 **전에** 바꾸면 well-known의 `resource`가 도달 불가한 URL을 광고해 `AC-002-4` 위반)
 - [x] `TASK-061` **[Small]** CI 배포 스텝 — GitHub Actions IAM 역할에 `lambda:UpdateFunctionCode` 추가(현재 ECR push 전용), 기본 브랜치 push에서만 동작하도록 게이트 — file: `.github/workflows/ci.yml`, `infra/01-ecr-and-github-oidc.sh` / traces: `AC-007-3`, FRD §10 Step 8
 
 ### Stage 2 착수 전 확인 (블로킹)
