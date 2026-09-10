@@ -159,52 +159,63 @@ ENV PYTHONUNBUFFERED=1 \
     MCP_PORT=8000
 
 # ---------------------------------------------------------------------------
-# TASK-050 — take whatever Debian security updates exist at build time.
+# TASK-050 — Debian security updates at build time.
 #
-# WHAT THIS DOES AND DOES NOT FIX (measured, and a correction of an earlier
-# conclusion recorded in PLAN.md):
+# WHAT THIS ACTUALLY DOES: measured, nothing. Kept anyway, and the reasoning
+# below is worth reading before deleting it.
 #
 # ECR `scanOnPush` reports CRITICAL 6 / HIGH 11 on this image, all of them
-# Debian OS packages — our own Python dependencies are 0 findings (verified
-# via OSV against all 40 packages `uv.lock` pins; `scripts/audit-dependencies.py`
-# now gates that continuously). The breakdown by package:
+# Debian OS packages. Our own Python dependencies are 0 findings (verified via
+# OSV against all 40 packages `uv.lock` pins; `scripts/audit-dependencies.py`
+# now gates that on every CI run). By package:
 #
 #     perl 13 (5 CRITICAL) · glibc 2 · sqlite3 2 · gzip 2 · zlib 1 · pcre2 1
 #
-# An earlier analysis concluded "`apt-get upgrade` would fix nothing". That
-# was **partly wrong**. Re-checked against OSV per-package:
+# THE ANALYSIS ARC, HONESTLY (three steps, two of them wrong):
 #
-#   - sqlite3 CVE-2025-7709 is fixed in `3.46.1-7+deb13u1` — the `deb13u1`
-#     suffix means a *trixie security update*, so it is installable here.
-#   - perl's CRITICALs (CVE-2026-12087 / -13221 / -42496) are fixed only in
-#     `5.42.3-1`, which is Debian unstable; trixie ships the 5.40.x series.
-#     Not installable, at any pin.
-#   - zlib CVE-2026-27171's fix (`1:1.3.dfsg+really1.3.2-1`) is likewise
-#     unstable-only.
+#  1. First conclusion: "`apt-get upgrade` would fix nothing" — reasoned from
+#     the Debian security tracker showing `status=open, fixed=-` in trixie.
+#  2. Then, re-checking per package against OSV, that looked wrong: sqlite3
+#     CVE-2025-7709 reports a fix in `3.46.1-7+deb13u1`, and the `deb13u1`
+#     suffix means a *trixie security update*, which is installable. So this
+#     RUN line was added expecting the sqlite3 finding to drop.
+#  3. Measured: the ECR scan of the resulting image is **byte-for-byte the
+#     same counts** — CRITICAL 6 / HIGH 11, every package unchanged. The build
+#     log says why:
 #
-# So this line is worth having — it takes the sqlite3 fix today and picks up
-# every future trixie security update on rebuild, with no Dockerfile edit —
-# but it does not clear the CRITICAL count, and no amount of apt work will.
+#         Get:3 http://deb.debian.org/debian-security trixie-security InRelease
+#         0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
 #
-# WHY THE perl FINDINGS CANNOT BE REMOVED EITHER:
-# TASK-050's option ① was "delete unused packages such as perl". That is not
+#     `trixie-security` *is* in the base image's sources and apt found nothing
+#     to do. So step 1 was right and step 2's correction was wrong: the
+#     `+deb13u1` sqlite3 fix is already installed, and ECR is matching against
+#     the *source* package version (`3.46.1-7`), which does not carry the
+#     binary revision — an ECR version-matching artifact, i.e. that finding is
+#     a false positive.
+#
+# WHY THE LINE STAYS: `0 upgraded` proves `python:3.14-slim-trixie` is current
+# *today*, not that it always will be. Base images are rebuilt on their own
+# cadence; this closes the window between an upstream security upload and the
+# next base rebuild, at the cost of one cached layer. It is not a fix for the
+# counts above and must not be mistaken for one.
+#
+# WHY THE perl FINDINGS CANNOT BE REMOVED AT ALL:
+# TASK-050's option ① was "delete unused packages such as perl". Not
 # available: the official `python:3.14-slim-trixie` Dockerfile installs only
-# `ca-certificates`, `netbase` and `tzdata` (read from docker-library/python
-# before writing this), so `perl` is not something this image asked for — it
-# arrives as `perl-base`, which Debian marks **Essential**. Purging an
-# Essential package breaks dpkg/apt, i.e. the cure is worse than the finding.
+# `ca-certificates`, `netbase` and `tzdata` (read from docker-library/python,
+# not assumed), so `perl` is not something this image asked for — it arrives
+# as `perl-base`, which Debian marks **Essential**. Purging an Essential
+# package breaks dpkg/apt. Its CRITICALs (CVE-2026-12087 / -13221 / -42496)
+# are fixed only in `5.42.3-1`, i.e. Debian unstable; trixie ships 5.40.x.
 #
-# RESIDUAL RISK, STATED PLAINLY: these CVEs are reachable only by code
-# already executing inside the container. This server never invokes perl,
-# sqlite3, gzip or pcre2 — it is a read-only HTTP surface over four GitHub
-# tools, running as a non-root user (below) on a Lambda-managed filesystem.
-# An attacker positioned to exploit them has already achieved code execution,
-# at which point the CVE is not the primary problem. The effective control is
-# the dependency gate on the code we actually control, which is why TASK-048
-# fails the build on *those* and only warns on these.
-#
-# `--no-install-recommends` keeps the upgrade from pulling in new packages;
-# the apt lists are removed in the same layer so they do not ship.
+# RESIDUAL RISK, STATED PLAINLY: these CVEs are reachable only by code already
+# executing inside the container. This server never invokes perl, sqlite3,
+# gzip or pcre2 — it is a read-only HTTP surface over four GitHub tools,
+# running as a non-root user (below) on a Lambda-managed filesystem. An
+# attacker positioned to exploit them already has code execution, at which
+# point the CVE is not the primary problem. The control that actually bites is
+# the dependency gate on code we author, which is why TASK-048 fails the build
+# on those findings and only warns on these.
 RUN apt-get update \
     && apt-get upgrade -y --no-install-recommends \
     && apt-get clean \
