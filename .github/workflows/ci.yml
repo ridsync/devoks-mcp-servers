@@ -114,8 +114,14 @@ jobs:
   # so the smoke test's timing/behavior is representative of the real
   # Fargate target instead of emulated.
   docker:
-    name: Docker build (arm64) + /healthz smoke
+    name: Docker build (arm64) + /healthz smoke + ECR push
     runs-on: ubuntu-24.04-arm
+    # `id-token: write` is what lets this job exchange a GitHub OIDC token for
+    # short-lived AWS credentials. Scoped to this job on purpose: the `quality`
+    # job has no business holding an AWS identity.
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -241,6 +247,59 @@ jobs:
       - name: Dump container logs (failure diagnostics)
         if: failure()
         run: docker logs mcp-smoke || true
+
+      # Only a build that answered /healthz gets published. Placing the push
+      # after the smoke test means a broken image never reaches ECR, so the
+      # registry only ever holds images that at least start.
+      #
+      # `push` events only: a pull_request run would publish a duplicate of a
+      # commit that is already being built on its branch, and fork PRs cannot
+      # get an OIDC token with these permissions anyway.
+      - name: Configure AWS credentials (OIDC)
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v6 # verified via GitHub API: v6 tag exists (latest v6.2.4)
+        with:
+          role-to-assume: arn:aws:iam::703630528452:role/devoks-mcp-github-actions
+          aws-region: ap-northeast-2
+          # Not a secret — an ARN is an identifier. The trust policy, not
+          # obscurity, is what restricts who may assume this role.
+
+      - name: Log in to Amazon ECR
+        if: github.event_name == 'push'
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2 # verified via GitHub API: v2 tag exists (latest v2.1.7)
+
+      # Tagged by commit SHA always, so any deployed task definition names an
+      # exact build. `latest` moves only on the default branch — a feature
+      # branch that also moved it would make `latest` mean "whoever pushed
+      # most recently", which is not something to deploy from.
+      - name: Push image to ECR
+        if: github.event_name == 'push'
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          REPOSITORY: devoks-mcp-management
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker tag devoks-mcp-management:ci "$REGISTRY/$REPOSITORY:$SHA"
+          docker push "$REGISTRY/$REPOSITORY:$SHA"
+          echo "pushed $REGISTRY/$REPOSITORY:$SHA"
+
+          if [ "${{ github.ref }}" = "refs/heads/${{ github.event.repository.default_branch }}" ]; then
+            docker tag devoks-mcp-management:ci "$REGISTRY/$REPOSITORY:latest"
+            docker push "$REGISTRY/$REPOSITORY:latest"
+            echo "pushed $REGISTRY/$REPOSITORY:latest"
+          else
+            echo "not the default branch - leaving :latest untouched"
+          fi
+
+          {
+            echo "### Image pushed to ECR"
+            echo ""
+            echo '```'
+            echo "$REGISTRY/$REPOSITORY:$SHA"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stop and remove container
         if: always()
