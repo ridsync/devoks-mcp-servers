@@ -182,7 +182,16 @@ flowchart TD
 - **실 클라이언트 왕복 회귀 가드** — `streamable_http_client` + `ClientSession`으로 `initialize` → `notifications/initialized` → `tools/list`가 stateless-JSON에서 성공하고 4툴이 그대로 보인다
 - `Settings`에 dataclass 기본값을 **주지 않았다** — 기본값의 단일 출처를 `config.py`로 유지해야 하며 양쪽에 두면 갈라진다. 대신 테스트 헬퍼 7곳을 명시적으로 갱신했다(이 중복이 `TASK-047` conftest 추출의 근거를 강화한다)
 - `.env.example` 16개 키 전량 파싱 재확인(PEM만 실제 키로 교체하는 README 절차 그대로)
-- ⚠️ **Dockerfile 변경은 로컬 검증 불가** — Docker 미설치(FRD §7). LWA `COPY --from`과 `AWS_LWA_*`는 **CI 빌드가 최초 검증자**다. LWA 태그 `1.1.0`의 존재·`linux/arm64` 매니페스트는 ECR Public 레지스트리 API로 사전 확인했다
+- **Dockerfile 변경 — CI에서 검증 완료**(로컬은 Docker 미설치, FRD §7). push 트리거 CI([run 34440746592](https://github.com/ridsync/devoks-mcp-servers/actions/runs/34440746592)) 두 잡 모두 **success**. 로그 원문 증거:
+  ```
+  #14 FROM public.ecr.aws/awsguru/aws-lambda-adapter:1.1.0@sha256:3a108c4ceee9e0346a61fc0fc7085017945c664be4eaa2925855b8dd2467227b
+  #23 [runtime 5/5] COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.1.0     /lambda-adapter /opt/extensions/lambda-adapter
+  "uri": "pkg:docker/public.ecr.aws/awsguru/aws-lambda-adapter@1.1.0?platform=linux%2Farm64"
+  GET /healthz -> 200 on attempt 3
+  {"name":"devoks-management-mcp","version":"0.1.0"}
+  ```
+  닫힌 것 4가지: ① `COPY --from`이 실제로 해석·실행됐다 — 소스 이미지에 `/lambda-adapter`가 없으면 빌드가 여기서 실패한다 ② **`linux/arm64` 변종이 당겨졌다**(`platform=linux%2Farm64`) → `CTR-010` 정합 ③ **확장이 들어 있는 채로 컨테이너가 `/healthz` 200을 응답했다** → "LWA 확장은 Lambda init만 기동시키므로 로컬·컨테이너 런타임에 무영향"이라는 `CTR-011`의 주장이 실측으로 확인됐다 ④ ECR 이미지 크기 `61,686,752` → `63,389,350` bytes(**+1,702,598**) → LWA 레이어가 푸시된 산출물에 실제로 존재한다
+- **아직 닫히지 않은 것 (은폐 금지)** — Lambda의 init 프로세스가 실제로 이 확장을 기동해 HTTP로 프록시하는지는 **컨테이너 런타임에서는 검증 불가능하다**(확장은 `AWS_LAMBDA_RUNTIME_API`가 있는 Lambda 환경에서만 시작된다). `TASK-059`의 실제 호출이 그 최종 검증자다. LWA가 누락됐거나 포트가 어긋났다면 그 시점에 **애플리케이션 로그 없는 타임아웃**으로 나타난다(Dockerfile의 `AWS_LWA_PORT` 주석에 기록된 실패 양상)
 
 ### PR6 — AWS 리소스 (되돌리기 어려움 → 각 Task 실행 전 사용자 확인)
 
