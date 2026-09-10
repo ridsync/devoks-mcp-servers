@@ -154,7 +154,8 @@ flowchart TD
   ```
   `platform: linux/arm64`, 러너 `ubuntu-24.04-arm`(네이티브, QEMU 없음). 로컬 Docker 미설치 제약은 그대로지만 **검증 자체는 닫혔다.**
 - [x] **`AC-007-3` CI 파이프라인 실동작 — 검증 완료.** 같은 run의 `Lint · type check · test` 잡도 success: `ruff check` → `All checks passed!` / `pyright` → `0 errors, 0 warnings, 0 informations` / `pytest` → `282 passed in 6.95s`. 두 잡 모두 통과해야 워크플로가 성공하며 `continue-on-error`는 없다.
-- [ ] **실 GitHub 대상 라이브 호출 미검증** — GitHub App(`RES-API-005`) 미생성(조직 관리자 작업). 전 경로가 `httpx2.MockTransport`로 검증됐고 JWT 클레임·헤더·엔드포인트·1MB/100MB 경계·rate limit 응답 형태는 **공식 문서와 대조**했으나, 실 자격증명으로 붙는 확인은 Stage 2 항목이다(FRD §10).
+- [x] **실 GitHub 대상 라이브 호출 — 검증 완료(2026-09-10, `TASK-059`).** 배포된 Lambda에서 4개 툴 전부 실 GitHub 호출 성공(§6 PR6 검증 결과 참조).
+- (이력) 원래 기록: GitHub App(`RES-API-005`) 미생성(조직 관리자 작업). 전 경로가 `httpx2.MockTransport`로 검증됐고 JWT 클레임·헤더·엔드포인트·1MB/100MB 경계·rate limit 응답 형태는 **공식 문서와 대조**했으나, 실 자격증명으로 붙는 확인은 Stage 2 항목이다(FRD §10).
 
 
 ---
@@ -199,9 +200,30 @@ flowchart TD
   - **완료(2026-09-10).** 파라미터 2개 생성·태그·복호화 왕복 검증 완료 — `Version 1` / `Standard` / `alias/aws/ssm`. `--with-decryption` 왕복에서 PEM 1,674 B·27줄, 토큰 JSON 96 B로 **원본과 바이트 단위 일치**. 임시 파일은 mode 600으로 만들고 `shred` 후 잔존 0건 확인. 값은 대화·로그에 출력하지 않았다.
   - **⚠️ 설계 정정 — Lambda에는 SSM 자동 주입이 없다.** 이 Task의 원래 서술은 ECS의 `secrets`/`valueFrom`를 전제했는데, `aws lambda create-function`의 옵션은 `--environment`와 `--kms-key-arn`뿐이다(CLI help 실측). 따라서 SSM 파라미터는 **원본 기록(source of record)**이고 실제 주입은 `TASK-057`이 여기서 읽어 `--environment`로 넣는다. Lambda는 환경변수를 저장 시 KMS로 암호화한다(공식 문서: "Lambda stores environment variables securely by encrypting them at rest"). 코드 변경이 없어 FRD의 env 주입 계약이 유지된다.
   - **잔여 노출 (후속 결정)** — 이 방식에서는 `lambda:GetFunctionConfiguration` 권한자가 환경변수 평문을 읽을 수 있다. 앱이 직접 SSM을 읽게 하면(boto3 또는 AWS Parameters and Secrets Lambda Extension) 함수 설정에서 시크릿이 사라지지만, 의존성 추가·콜드스타트 증가·`config.py`의 env 기반 계약 변경이 따른다. 계정 사용자가 늘거나 역할이 분화되는 시점이 재검토 트리거다
-- [ ] `TASK-057` **[Medium]** Lambda 실행 역할(CloudWatch Logs 쓰기 + 위 2개 파라미터 `GetParameter` + KMS `Decrypt`만) + 로그 그룹(보존기간 설정 — 서울 수집 $0.76/GB) + 함수 생성(ECR 이미지, `arm64`, 512 MB, 타임아웃 60초) — file: `infra/03-lambda.sh` / traces: FRD §10 Step 4
-- [ ] `TASK-058` **[Small]** Function URL `AuthType=NONE` 생성 후 **2단계 주입** — `<url-id>`가 생성 시점에 결정되므로 URL 확보 후 `MCP_PUBLIC_URL`(`…/mcp` 경로 필수)·`MCP_ALLOWED_HOSTS`를 주입한다. `AWS_IAM`이 아닌 이유: SigV4가 `Authorization` 헤더를 점유해 Bearer와 충돌 — file: `infra/03-lambda.sh` / traces: `EDGE-019`, FRD §10 Step 5
-- [ ] `TASK-059` **[Medium]** 실제 MCP 클라이언트(Claude Code) E2E — 원격 등록 → `initialize` → 4툴 호출. allowlist 밖 저장소 거부·경로 트래버설 차단(`EDGE-013`)·qualifier 주입 차단(`EDGE-014`)이 **배포 환경에서도** 재현되는지 확인. `MCP_REPO_ALLOWLIST` 프로덕션 값 확정. 콜드스타트 실측(`EDGE-016`) — traces: `AC-005-*`, `EDGE-013`, `EDGE-014`, `EDGE-016`
+- [x] `TASK-057` **[Medium]** Lambda 실행 역할(CloudWatch Logs 쓰기 + 위 2개 파라미터 `GetParameter` + KMS `Decrypt`만) + 로그 그룹(보존기간 설정 — 서울 수집 $0.76/GB) + 함수 생성(ECR 이미지, `arm64`, 512 MB, 타임아웃 60초) — file: `infra/03-lambda.sh` / traces: FRD §10 Step 4
+- [x] `TASK-058` **[Small]** Function URL `AuthType=NONE` 생성 후 **2단계 주입** — `<url-id>`가 생성 시점에 결정되므로 URL 확보 후 `MCP_PUBLIC_URL`(`…/mcp` 경로 필수)·`MCP_ALLOWED_HOSTS`를 주입한다. `AWS_IAM`이 아닌 이유: SigV4가 `Authorization` 헤더를 점유해 Bearer와 충돌 — file: `infra/03-lambda.sh` / traces: `EDGE-019`, FRD §10 Step 5
+- [x] `TASK-059` **[Medium]** 실제 MCP 클라이언트(Claude Code) E2E — 원격 등록 → `initialize` → 4툴 호출. allowlist 밖 저장소 거부·경로 트래버설 차단(`EDGE-013`)·qualifier 주입 차단(`EDGE-014`)이 **배포 환경에서도** 재현되는지 확인. `MCP_REPO_ALLOWLIST` 프로덕션 값 확정. 콜드스타트 실측(`EDGE-016`) — traces: `AC-005-*`, `EDGE-013`, `EDGE-014`, `EDGE-016`
+
+**PR6 Step 4~6 검증 결과 (2026-09-10) — 라이브 배포 완료**
+
+Function URL: `https://zhruzqvcl52iprokp3j63ytiu40smiel.lambda-url.ap-northeast-2.on.aws`
+구축물: 로그 그룹(보존 30일) · 실행 역할 `devoks-mcp-management-lambda`(최소권한, 관리형 정책 0개) · 함수(Image/arm64/512MB/60s) · Function URL(`NONE`/BUFFERED) · 권한 statement 2개. 재현 스크립트 `infra/03-lambda.sh`.
+
+- **`CTR-011`(LWA 패키징)의 마지막 미검증 항목이 닫혔다.** CloudWatch 로그 원문:
+  ```
+  EXTENSION	Name: lambda-adapter	State: Ready	Events: []
+  INFO app is not ready after 2000ms url=http://127.0.0.1:8000/healthz
+  StreamableHTTP session manager started
+  INFO:     127.0.0.1:57774 - "GET /healthz HTTP/1.1" 200 OK
+  ```
+  Lambda init이 확장을 실제로 기동했고(`State: Ready`), 준비성 프로브가 `AWS_LWA_READINESS_CHECK_PATH`/`AWS_LWA_PORT` 설정대로 우리 앱을 기다렸고, `session_manager.run()` lifespan이 컨테이너 수명당 1회 진입했다. 함수 직접 호출 응답에는 `"server": "uvicorn"`이 찍혔다.
+- **`AC-002-4` 프로덕션 검증** — well-known 문서의 `resource`가 `MCP_PUBLIC_URL`과 **정확히 일치**(`.../mcp`, 후행 슬래시 없음), `scopes_supported=['devoks:read']`. 무인증 `POST /mcp` → **401 `invalid_token`**
+- **4개 툴 전부 실 GitHub 대상 동작** — `list_repos`가 allowlist 범위대로 1개 저장소만 반환(422~930 ms), `get_repo_tree` 346 ms, `read_file` 352 ms(`status=complete`), `search_code` 773 ms. **`PLAN` §5의 "실 GitHub 대상 라이브 호출 미검증" 항목이 이로써 닫힌다**
+- **보안 경계 3종이 배포 환경에서 재현 차단됨** — `EDGE-013` 경로 트래버설(`../` 및 4툴 표면 이탈 시도 모두) / `CTR-008` allowlist 밖 저장소(고정 메시지 "Not authorized to perform this request."로 존재 여부 미노출) / `EDGE-014` qualifier 주입 3종(`repo:`/`org:`/`user:`)
+- **`AC-004` 감사 로그 프로덕션 검증** — CloudWatch에 감사 레코드 13건, `CTR-003` 11개 필드 전량. **`duration_ms=0`이 "GitHub 호출 없이 차단"의 증거**다: allowlist 밖 → `outcome=denied`·`reason_code=repo_not_allowlisted`·0 ms / 트래버설·주입 → `outcome=error`·`error_kind=ToolError`·0 ms / 정상 호출 → `outcome=ok`·344~930 ms. 시크릿 유출 0건, `args_summary`에 파일 본문 없음. `TASK-004`가 찾은 `reason_code`/`error_kind` 분리가 프로덕션 로그 질의에서 실제로 구별된다
+- **콜드스타트 실측 → `EDGE-016` 정정** — 새 이미지 첫 1회 **8,511 ms**(이미지 최적화 일회성), 이후 **~1,900 ms**. 메모리 증설은 무효(512/1024/1769 MB에서 1,923/2,007/1,877 ms). `Max Memory Used` 116 MB → 512 MB 유지가 측정 근거 있는 선택. 웜 호출은 2~4 ms
+- **겪은 함정 2개를 `EDGE-020`·`EDGE-021`로 기록** — Function URL 403의 원인이 권한 statement **2개** 필요(`InvokeFunctionUrl` + `InvokeFunction`)였고, 환경변수 총량 4 KB 한계가 PEM 크기와 맞물린다
+
 - [ ] `TASK-060` **[Medium]** 커스텀 도메인 `mcp.devoks.kr` — **API Gateway HTTP API**(CloudFront 아님, 근거 FRD §7·§10 Step 7). ACM 인증서(`ap-northeast-2`) + HTTP API + Lambda 프록시 통합 + 커스텀 도메인 + 가비아 CNAME 2건(ACM 검증 underscore, `mcp` → 리전 엔드포인트). 완료 후 `MCP_PUBLIC_URL`·`MCP_ALLOWED_HOSTS` 전환 — file: `infra/04-custom-domain.sh` / traces: `CTR-001`, `EDGE-018`, `EDGE-019`
 - [ ] `TASK-061` **[Small]** CI 배포 스텝 — GitHub Actions IAM 역할에 `lambda:UpdateFunctionCode` 추가(현재 ECR push 전용), 기본 브랜치 push에서만 동작하도록 게이트 — file: `.github/workflows/ci.yml`, `infra/01-ecr-and-github-oidc.sh` / traces: `AC-007-3`, FRD §10 Step 8
 
