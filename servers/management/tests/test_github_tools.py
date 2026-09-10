@@ -56,8 +56,6 @@ from typing import TYPE_CHECKING, Any
 
 import httpx2
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 from mcp.client import Client
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
@@ -65,6 +63,7 @@ from mcp.server.auth.provider import AccessToken
 from mcp.server.mcpserver import MCPServer
 from mcp_types import ContentBlock, TextContent
 
+from conftest import make_settings
 from devoks_mcp_management import app as app_module
 from devoks_mcp_management.config import Settings
 from devoks_mcp_management.server import create_server
@@ -106,21 +105,6 @@ _UNUSED_MCP_ARG: Any = None
 # --- Test scaffolding ---------------------------------------------------------------
 
 
-def _generate_pem() -> str:
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pem = key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    return pem.decode("utf-8")
-
-
-@pytest.fixture(scope="module")
-def pem() -> str:
-    return _generate_pem()
-
-
 def _settings(
     *,
     private_key: str,
@@ -128,22 +112,12 @@ def _settings(
     read_file_max_bytes: int = 262_144,
     search_code_max_results: int = 30,
 ) -> Settings:
-    return Settings(
-        allowed_hosts=("mcp.example.com",),
-        public_url="https://mcp.example.com/mcp",
-        issuer_url="https://issuer.example.com",
+    return make_settings(
         repo_allowlist=repo_allowlist,
-        role_tools={READER_ROLE: ALL_FOUR_TOOLS},
         github_app_id="app-123456",
         github_app_installation_id="install-789012",
-        port=8000,
-        log_level="INFO",
         read_file_max_bytes=read_file_max_bytes,
         search_code_max_results=search_code_max_results,
-        token_refresh_leeway_seconds=300,
-        stateless_http=True,
-        json_response=True,
-        client_tokens={},
         github_app_private_key=private_key,
     )
 
@@ -673,3 +647,57 @@ async def test_search_code_qualifier_injection_full_stack_blocked_with_zero_gith
 
     assert result.is_error is True
     assert handler.requests == []
+
+
+# --- TASK-044: an empty allowlist must not spend a GitHub round trip -----------
+
+
+async def test_list_repos_with_empty_allowlist_makes_no_github_request(
+    monkeypatch: pytest.MonkeyPatch, pem: str
+) -> None:
+    """CTR-008's default allowlist is *empty*, and an empty allowlist denies
+    every repository by construction, so the intersection ``list_repos``
+    computes is empty no matter what the installation can see.
+
+    Calling GitHub anyway spent a rate-limit unit (EDGE-003) on a response
+    whose every element was then filtered away -- and on a freshly deployed
+    server where ``MCP_REPO_ALLOWLIST`` has not been set yet, that is *every*
+    ``list_repos`` call. The assertion is on ``handler.requests``, not on the
+    result, because the result was already correct before the fix; only the
+    wasted round trip changed.
+
+    Note ``handler.repos`` is left empty *and* unreachable: the handler would
+    raise on any unexpected path, so a regression that removes the guard
+    clause fails loudly rather than silently.
+    """
+    settings = _settings(private_key=pem, repo_allowlist=frozenset())
+    handler = _GitHubHandler()
+    mcp, _factory = _build_server(monkeypatch, settings, handler)
+
+    with _identity(_access_token(READER_ROLE)):
+        async with Client(mcp) as client:
+            result = await client.call_tool(TOOL_LIST_REPOS, {})
+
+    assert result.is_error is False
+    assert result.structured_content == {"repos": [], "count": 0}
+    assert handler.requests == []
+
+
+async def test_list_repos_with_non_empty_allowlist_still_calls_github(
+    monkeypatch: pytest.MonkeyPatch, pem: str
+) -> None:
+    """The guard clause must be scoped to the empty case only -- a fix that
+    short-circuited unconditionally would also pass the test above."""
+    settings = _settings(private_key=pem, repo_allowlist=frozenset({"acme/widgets"}))
+    handler = _GitHubHandler()
+    handler.repos = ({"full_name": "acme/widgets", "name": "widgets", "default_branch": "main"},)
+    mcp, _factory = _build_server(monkeypatch, settings, handler)
+
+    with _identity(_access_token(READER_ROLE)):
+        async with Client(mcp) as client:
+            result = await client.call_tool(TOOL_LIST_REPOS, {})
+
+    payload = result.structured_content
+    assert payload is not None
+    assert payload["count"] == 1
+    assert any(request.url.path == "/installation/repositories" for request in handler.requests)

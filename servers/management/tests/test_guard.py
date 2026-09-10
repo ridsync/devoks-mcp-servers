@@ -22,9 +22,10 @@ from mcp.server.auth.provider import AccessToken
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import INVALID_PARAMS
 
+from conftest import make_settings
 from devoks_mcp_management.config import Settings
 from devoks_mcp_management.tools.guard import make_tool_guard
-from devoks_mcp_management.types import AuditRecord
+from devoks_mcp_management.types import AuditRecord, SecurityBoundaryError
 
 READER_ROLE = "reader"
 READER_TOOLS = frozenset({"read_file", "list_repos"})
@@ -37,22 +38,14 @@ def _settings(
     role_tools: dict[str, frozenset[str]] | None = None,
     repo_allowlist: frozenset[str] = frozenset({ALLOWED_REPO}),
 ) -> Settings:
-    return Settings(
-        allowed_hosts=("mcp.example.com",),
+    return make_settings(
+        # AC-002-4 does not apply to the guard layer, which never renders the
+        # well-known document — this bare-domain URL is kept as-is from the
+        # original helper so the guard tests stay independent of CTR-001's
+        # path rule.
         public_url="https://mcp.example.com",
-        issuer_url="https://issuer.example.com",
         repo_allowlist=repo_allowlist,
         role_tools=role_tools if role_tools is not None else {READER_ROLE: READER_TOOLS},
-        github_app_id="app-id",
-        github_app_installation_id="install-id",
-        port=8000,
-        log_level="INFO",
-        read_file_max_bytes=262_144,
-        search_code_max_results=30,
-        token_refresh_leeway_seconds=300,
-        stateless_http=True,
-        json_response=True,
-        client_tokens={},
         github_app_private_key="unused-in-guard-tests",
     )
 
@@ -503,3 +496,159 @@ async def test_repeated_calls_each_produce_their_own_independent_audit_record() 
     assert [r.outcome for r in recorder.records] == ["ok", "denied", "ok"]
     assert [r.request_id for r in recorder.records] == produced_ids
     assert len(set(produced_ids)) == 3
+
+
+# --- TASK-045: a non-string repo argument must fail *safe*, not open -----------
+
+
+@pytest.mark.parametrize("bad_repo", [123, 1.5, {"owner": "x"}, ["org/repo"], object()])
+async def test_non_string_repo_argument_is_denied_and_body_never_runs(
+    bad_repo: object,
+) -> None:
+    """``authorize()`` skips the CTR-008 allowlist check entirely when the
+    extracted repo is ``None``.
+
+    The guard used to hand it ``None`` for *any* non-``str`` value, so a
+    malformed ``repo`` was authorized **without the allowlist ever being
+    consulted** — a fail-open whose audit line said ``outcome=ok``. Asserted
+    through the public decorator rather than the private extractor so the
+    observable consequences are pinned: the body does not run, and the audit
+    record classifies it as a denial with the allowlist reason code.
+
+    In practice the MCP SDK rejects a wrong-typed argument against the tool
+    signature before the guard is reached, so this is defense in depth for
+    the case where that layer changes — not a currently reachable path.
+    """
+    recorder = _Recorder()
+    guard = _make_guard(_settings(), emit=recorder)
+    body_ran = False
+
+    @guard("read_file", repo_arg="repo")
+    async def read_file(repo: object) -> str:
+        nonlocal body_ran
+        body_ran = True
+        return "unreachable"
+
+    with _identity(_access_token(READER_ROLE)), pytest.raises(ToolError):
+        await read_file(repo=bad_repo)
+
+    assert body_ran is False
+    assert recorder.records[0].outcome == "denied"
+    assert recorder.records[0].reason_code == "repo_not_allowlisted"
+
+
+async def test_absent_repo_argument_still_skips_the_check() -> None:
+    """The fix must not turn legitimate "no repository" calls into denials.
+
+    ``list_repos`` declares no ``repo_arg`` at all, and an optional parameter
+    left unset binds to ``None``; both must keep resolving to "skip the repo
+    check", otherwise TASK-045 would have traded a fail-open for a false
+    denial.
+    """
+    recorder = _Recorder()
+    guard = _make_guard(_settings(), emit=recorder)
+
+    @guard("list_repos")
+    async def list_repos() -> str:
+        return "ran"
+
+    with _identity(_access_token(READER_ROLE)):
+        assert await list_repos() == "ran"
+
+    assert recorder.records[0].outcome == "ok"
+    assert recorder.records[0].reason_code is None
+
+
+async def test_none_repo_argument_is_treated_as_absent() -> None:
+    recorder = _Recorder()
+    guard = _make_guard(_settings(), emit=recorder)
+
+    @guard("read_file", repo_arg="repo")
+    async def read_file(repo: str | None = None) -> str:
+        return "ran"
+
+    with _identity(_access_token(READER_ROLE)):
+        assert await read_file(repo=None) == "ran"
+
+    assert recorder.records[0].outcome == "ok"
+
+
+# --- TASK-049: security-boundary violations audit as `denied`, not `error` -----
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "message"),
+    [
+        ("path_traversal_attempt", "Invalid 'path' argument: '.' and '..' not allowed"),
+        ("query_qualifier_injection", "Invalid search query: 'repo'-style not allowed"),
+    ],
+)
+async def test_security_boundary_error_is_audited_as_denied_with_its_reason_code(
+    reason_code: str, message: str
+) -> None:
+    """Before TASK-049 these landed as ``outcome=error``/``error_kind=ToolError``
+    — the same bucket as "file not found" and "rate limited", where an
+    allowlist-escape probe is indistinguishable from ordinary noise.
+
+    Verified against the deployed server's real CloudWatch records before the
+    change, so this test pins the corrected classification: ``denied`` with a
+    queryable ``reason_code`` and, deliberately, ``error_kind=None`` — CTR-003
+    keeps the two fields apart so a log query separates "a boundary refused
+    this" from "the body blew up".
+    """
+    recorder = _Recorder()
+    guard = _make_guard(_settings(), emit=recorder)
+
+    @guard("read_file", repo_arg="repo")
+    async def read_file(repo: str) -> str:
+        raise SecurityBoundaryError(message, reason_code=reason_code)  # type: ignore[arg-type]
+
+    with _identity(_access_token(READER_ROLE)), pytest.raises(ToolError) as excinfo:
+        await read_file(repo=ALLOWED_REPO)
+
+    record = recorder.records[0]
+    assert record.outcome == "denied"
+    assert record.reason_code == reason_code
+    assert record.error_kind is None
+    # AC-003-5: the caller's view is unchanged — the same message passes through.
+    assert str(excinfo.value) == message
+
+
+async def test_security_boundary_error_emits_exactly_one_audit_record() -> None:
+    """The `finally` block is the single emit site.
+
+    An earlier draft of TASK-049 called `record()` inside the `except` clause
+    as well, which produced **two** audit lines for one tool call — the kind
+    of double-count that silently inflates a security dashboard.
+    """
+    recorder = _Recorder()
+    guard = _make_guard(_settings(), emit=recorder)
+
+    @guard("read_file", repo_arg="repo")
+    async def read_file(repo: str) -> str:
+        raise SecurityBoundaryError("nope", reason_code="path_traversal_attempt")
+
+    with _identity(_access_token(READER_ROLE)), pytest.raises(ToolError):
+        await read_file(repo=ALLOWED_REPO)
+
+    assert len(recorder.records) == 1
+
+
+async def test_ordinary_tool_error_still_audits_as_error() -> None:
+    """The new clause must not widen: a plain ToolError keeps its `error`
+    classification, otherwise every "file not found" would show up as a
+    security event."""
+    recorder = _Recorder()
+    guard = _make_guard(_settings(), emit=recorder)
+
+    @guard("read_file", repo_arg="repo")
+    async def read_file(repo: str) -> str:
+        raise ToolError("GitHub repository, ref, or path not found")
+
+    with _identity(_access_token(READER_ROLE)), pytest.raises(ToolError):
+        await read_file(repo=ALLOWED_REPO)
+
+    record = recorder.records[0]
+    assert record.outcome == "error"
+    assert record.error_kind == "ToolError"
+    assert record.reason_code is None

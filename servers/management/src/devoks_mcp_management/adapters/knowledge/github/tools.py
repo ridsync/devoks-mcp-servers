@@ -271,6 +271,21 @@ async def list_repos(ctx: Context) -> ListReposResult:
     `read_file`, or `search_code`.
     """
     github, repo_allowlist = _require_lifespan(ctx)
+    if not repo_allowlist:
+        # TASK-044 / EDGE-001: an empty allowlist denies every repository by
+        # construction (`is_repo_allowlisted` can never match), so the
+        # intersection below is empty regardless of what the installation can
+        # see. Returning here skips a GitHub round trip whose entire result
+        # would be filtered away — which matters beyond tidiness: that call
+        # spends a rate-limit unit (EDGE-003) and, on a fresh deployment where
+        # `MCP_REPO_ALLOWLIST` has not been set yet (its default *is* empty —
+        # CTR-008), it would be spent on every `list_repos` call.
+        #
+        # The response shape is identical to the filtered-to-nothing case, so
+        # a client cannot distinguish "allowlist is empty" from "installation
+        # sees nothing allowlisted" — same direction as AC-003-5's refusal to
+        # leak allowlist contents.
+        return {"repos": [], "count": 0}
     installation_repos = await github.list_installation_repositories()
     allowed = [
         repo for repo in installation_repos if is_repo_allowlisted(repo.full_name, repo_allowlist)

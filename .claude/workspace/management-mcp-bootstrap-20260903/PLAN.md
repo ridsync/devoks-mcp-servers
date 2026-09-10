@@ -80,15 +80,15 @@ issue: https://github.com/ridsync/devoks-mcp-servers/issues/1
 
 ### 후속 (이번 범위 밖 — 사용자가 Critical+High만 선택)
 
-- [ ] `TASK-043` **[Medium]** 비ASCII Bearer 토큰이 `secrets.compare_digest`에서 `TypeError` → 500 + 트레이스백. `isascii()` 가드 또는 bytes 비교로 401 처리 — file: `auth/verifier.py`
-- [ ] `TASK-044` **[Medium]** `list_repos` 빈 allowlist 시 조기 반환(불필요 GitHub 호출 제거) — file: `adapters/knowledge/github/tools.py`
-- [ ] `TASK-045` **[Low]** `_extract_str_arg`의 non-str `repo` fail-**open** → 매칭 불가 sentinel로 fail-safe 전환 — file: `tools/guard.py`
-- [ ] `TASK-046` **[Low]** `MCP_CLIENT_TOKENS` 최소 길이 검증 + `.env.example`·CI 예시 갱신 + README에 `secrets.token_urlsafe(32)` 안내 — file: `config.py`
-- [ ] `TASK-047` **[Low]** 테스트 픽스처 `conftest.py` 추출(`_generate_pem`·`_settings` 5개 파일 중복) — file: `servers/management/tests/conftest.py`
+- [x] `TASK-043` **[Medium]** 비ASCII Bearer 토큰이 `secrets.compare_digest`에서 `TypeError` → 500 + 트레이스백. `isascii()` 가드 또는 bytes 비교로 401 처리 — file: `auth/verifier.py`
+- [x] `TASK-044` **[Medium]** `list_repos` 빈 allowlist 시 조기 반환(불필요 GitHub 호출 제거) — file: `adapters/knowledge/github/tools.py`
+- [x] `TASK-045` **[Low]** `_extract_str_arg`의 non-str `repo` fail-**open** → 매칭 불가 sentinel로 fail-safe 전환 — file: `tools/guard.py`
+- [x] `TASK-046` **[Low]** `MCP_CLIENT_TOKENS` 최소 길이 검증 + `.env.example`·CI 예시 갱신 + README에 `secrets.token_urlsafe(32)` 안내 — file: `config.py`
+- [x] `TASK-047` **[Low]** 테스트 픽스처 `conftest.py` 추출(`_generate_pem`·`_settings` 5개 파일 중복) — file: `servers/management/tests/conftest.py`
 - [ ] `TASK-048` Stage 2 진입 전 CI에 의존성 감사 스텝(`pip-audit` 또는 OSV 조회) 추가 — file: `.github/workflows/ci.yml`
 - [ ] `TASK-050` **[베이스 이미지 취약점]** ECR `scanOnPush`가 CRITICAL 6 / HIGH 11을 보고한다. **전부 `python:3.14-slim-trixie` 베이스의 Debian OS 패키지**이며 우리 Python 코드·의존성은 0건이다(OSV 40패키지 확인). `perl`이 21건 중 13건·CRITICAL 6건 중 5건을 차지하는데 **우리 서버는 perl을 호출하지 않는다**. Debian 보안 트래커 확인 결과 해당 CVE 전부 trixie에서 `status=open`·`fixed=-` — **`apt-get upgrade`로는 한 건도 줄지 않는다**(빌드 시간·레이어만 증가). 실효 있는 선택지: ① 미사용 패키지(`perl` 등) 제거 — CI 스모크가 검증 harness가 되므로 깨지면 즉시 드러난다 ② distroless/alpine 등 베이스 계열 전환 — musl·uv 조합 검증 필요. **현 위험 평가**: 이 CVE들은 컨테이너 안에서 이미 코드 실행이 가능한 상태를 전제하므로, 그 시점엔 CVE가 주 문제가 아니다. 배포를 막지 않되 공개 서비스로 굳히기 전에 ①을 시도할 가치가 있다 — file: `servers/management/Dockerfile`
 
-- [ ] `TASK-049` **[관측성]** 경로 트래버설·qualifier 인젝션 시도가 감사에 `outcome=error`로 남는다(메인 루프 재검증에서 관찰). 클라이언트 입력 검증에서 나온 `ToolError`라 그렇지만, 운영자가 "allowlist 탈출 시도"를 탐지하려면 `denied`를 본다. 보안 경계 위반은 `outcome=denied` + 전용 `reason_code`(예: `path_traversal_attempt`·`query_qualifier_injection`)로 분류해 탐지 가능하게 — file: `adapters/knowledge/github/client.py`, `tools/guard.py`, `types.py`
+- [x] `TASK-049` **[관측성]** 경로 트래버설·qualifier 인젝션 시도가 감사에 `outcome=error`로 남는다(메인 루프 재검증에서 관찰). 클라이언트 입력 검증에서 나온 `ToolError`라 그렇지만, 운영자가 "allowlist 탈출 시도"를 탐지하려면 `denied`를 본다. 보안 경계 위반은 `outcome=denied` + 전용 `reason_code`(예: `path_traversal_attempt`·`query_qualifier_injection`)로 분류해 탐지 가능하게 — file: `adapters/knowledge/github/client.py`, `tools/guard.py`, `types.py`
 
 > **PR4 완료** — `TASK-040`·`041`·`042` 3개 `[x]`. **테스트 235 → 282개**(신규 47: client 41 + tools 3 + credentials 3). 메인 루프 독립 재현으로 공격 5종(타 저장소 트래버설·툴 표면 이탈·qualifier 인젝션·백슬래시·대소문자 변형) **전부 차단 + GitHub 호출 0회** 확인, 정상 경로 6종 과잉 차단 없음 확인.
 

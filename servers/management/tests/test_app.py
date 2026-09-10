@@ -18,11 +18,10 @@ from contextlib import asynccontextmanager
 
 import httpx2
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route
 
+from conftest import make_settings
 from devoks_mcp_management import app as app_module
 from devoks_mcp_management.app import create_app, create_app_from_env
 from devoks_mcp_management.config import ClientToken, Settings
@@ -30,7 +29,10 @@ from devoks_mcp_management.server import SERVER_NAME
 
 _ALLOWED_HOST = "mcp.example.com"
 _PUBLIC_URL = "https://mcp.example.com/mcp"
-_VALID_TOKEN = "secret-token"  # noqa: S105 -- test fixture literal, not a real credential
+# >= 32 characters so this fixture also survives `load_settings`, which
+# enforces config.py's token floor (TASK-046) — this module feeds it through
+# `create_app_from_env`, unlike the modules that build `Settings` directly.
+_VALID_TOKEN = "test-fixture-token-not-a-real-credential"  # noqa: S105
 
 
 def _settings(
@@ -45,45 +47,16 @@ def _settings(
     # Direct dataclass construction, not load_settings() -- same pattern
     # test_server.py already uses for HTTP/wiring tests that never touch
     # github_app_private_key content, so no PEM fixture is needed here.
-    return Settings(
+    return make_settings(
         allowed_hosts=allowed_hosts,
         public_url=public_url,
-        issuer_url="https://issuer.example.com",
-        repo_allowlist=frozenset({"ridsync/devoks-mcp-servers"}),
-        role_tools={
-            "reader": frozenset({"list_repos", "get_repo_tree", "read_file", "search_code"})
-        },
-        github_app_id="app-id",
-        github_app_installation_id="install-id",
-        port=8000,
         log_level=log_level,
-        read_file_max_bytes=262_144,
-        search_code_max_results=30,
-        token_refresh_leeway_seconds=300,
         stateless_http=stateless_http,
         json_response=json_response,
         client_tokens=client_tokens
         if client_tokens is not None
         else {_VALID_TOKEN: ClientToken(client_id="c1", role="reader", scopes=("devoks:read",))},
-        github_app_private_key="unused-in-app-tests",
     )
-
-
-def _generate_pem() -> str:
-    """A throwaway RSA key generated in-process (mirrors test_config.py) -- only
-    needed by the create_app_from_env() tests, which go through load_settings()."""
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pem = key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    return pem.decode("utf-8")
-
-
-@pytest.fixture(scope="module")
-def pem() -> str:
-    return _generate_pem()
 
 
 def _valid_env(pem_value: str) -> dict[str, str]:

@@ -53,13 +53,12 @@ from typing import Any
 
 import httpx2
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 from mcp.client import Client
 from mcp.server.auth.middleware.auth_context import auth_context_var
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 
+from conftest import make_settings
 from devoks_mcp_management import app as app_module
 from devoks_mcp_management.adapters.knowledge.github.client import GitHubClient
 from devoks_mcp_management.adapters.knowledge.github.credentials import InstallationTokenProvider
@@ -104,24 +103,6 @@ _UNUSED_MCP_ARG: Any = None
 # --- Test scaffolding ---------------------------------------------------------------
 
 
-def _generate_pem() -> str:
-    """A throwaway RSA key generated in-process (mirrors test_credentials.py/
-    test_config.py/test_app.py) -- only tests that actually exercise token
-    issuance need a real, parseable PEM."""
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pem = key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    return pem.decode("utf-8")
-
-
-@pytest.fixture(scope="module")
-def pem() -> str:
-    return _generate_pem()
-
-
 def _settings(
     *,
     private_key: str = "unused-in-this-test",
@@ -129,22 +110,10 @@ def _settings(
 ) -> Settings:
     # Direct dataclass construction -- same pattern test_server.py/
     # test_github_tools_wiring.py already use.
-    return Settings(
-        allowed_hosts=("mcp.example.com",),
-        public_url="https://mcp.example.com/mcp",
-        issuer_url="https://issuer.example.com",
+    return make_settings(
         repo_allowlist=repo_allowlist,
-        role_tools={READER_ROLE: ALL_FOUR_TOOLS},
         github_app_id="app-123456",
         github_app_installation_id="install-789012",
-        port=8000,
-        log_level="INFO",
-        read_file_max_bytes=262_144,
-        search_code_max_results=30,
-        token_refresh_leeway_seconds=300,
-        stateless_http=True,
-        json_response=True,
-        client_tokens={},
         github_app_private_key=private_key,
     )
 

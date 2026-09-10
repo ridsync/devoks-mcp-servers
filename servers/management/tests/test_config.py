@@ -5,11 +5,11 @@ EDGE-008, DSN-006.
 """
 
 import json
+import secrets
 
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 
+from conftest import VALID_TEST_TOKEN
 from devoks_mcp_management.config import ConfigError, Settings, load_settings
 from devoks_mcp_management.types import (
     READ_FILE_MAX_BYTES_DEFAULT,
@@ -23,21 +23,8 @@ from devoks_mcp_management.types import (
     TOKEN_REFRESH_LEEWAY_SECONDS_MIN,
 )
 
-
-def _generate_pem() -> str:
-    """A throwaway RSA key generated in-process — never committed to disk."""
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pem = key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    return pem.decode("utf-8")
-
-
-@pytest.fixture(scope="module")
-def pem() -> str:
-    return _generate_pem()
+# `generate_pem` / the session-scoped `pem` fixture now live in conftest.py
+# (TASK-047) — three modules were each paying for their own 2048-bit keygen.
 
 
 def _valid_env(pem_value: str) -> dict[str, str]:
@@ -47,7 +34,7 @@ def _valid_env(pem_value: str) -> dict[str, str]:
         "MCP_ISSUER_URL": "https://issuer.example.com",
         "MCP_CLIENT_TOKENS": json.dumps(
             {
-                "tok-abc123": {
+                VALID_TEST_TOKEN: {
                     "client_id": "claude-code",
                     "role": "reader",
                     "scopes": ["devoks:read"],
@@ -79,9 +66,9 @@ def test_valid_env_loads_settings_successfully(pem: str) -> None:
     assert settings.role_tools == {
         "reader": frozenset({"list_repos", "get_repo_tree", "read_file", "search_code"})
     }
-    assert settings.client_tokens["tok-abc123"].client_id == "claude-code"
-    assert settings.client_tokens["tok-abc123"].role == "reader"
-    assert settings.client_tokens["tok-abc123"].scopes == ("devoks:read",)
+    assert settings.client_tokens[VALID_TEST_TOKEN].client_id == "claude-code"
+    assert settings.client_tokens[VALID_TEST_TOKEN].role == "reader"
+    assert settings.client_tokens[VALID_TEST_TOKEN].scopes == ("devoks:read",)
     assert settings.github_app_id == "123456"
     assert settings.github_app_installation_id == "789012"
     assert settings.port == 8000
@@ -371,7 +358,7 @@ def test_role_tools_referencing_unknown_tool_fails_startup(pem: str) -> None:
 def test_client_token_role_not_defined_in_role_tools_fails_startup(pem: str) -> None:
     env = _valid_env(pem)
     env["MCP_CLIENT_TOKENS"] = json.dumps(
-        {"tok-abc123": {"client_id": "claude-code", "role": "admin", "scopes": ["devoks:read"]}}
+        {VALID_TEST_TOKEN: {"client_id": "claude-code", "role": "admin", "scopes": ["devoks:read"]}}
     )
     # MCP_ROLE_TOOLS only defines "reader", not "admin".
     with pytest.raises(ConfigError, match="admin"):
@@ -490,7 +477,102 @@ def test_settings_repr_and_str_do_not_expose_token_table_or_private_key(pem: str
 
     rendered = repr(settings) + str(settings)
 
-    assert "tok-abc123" not in rendered
+    assert VALID_TEST_TOKEN not in rendered
     assert pem not in rendered
     # A representative substring from the PEM body, in case of re-wrapping.
     assert "PRIVATE KEY" not in rendered
+
+
+# --- TASK-046: MCP_CLIENT_TOKENS minimum length --------------------------------
+
+
+def test_the_published_env_example_placeholder_token_cannot_start_the_server(
+    pem: str,
+) -> None:
+    """The exact string that reached production, pinned as a test.
+
+    The deployed Lambda was found running with ``dev-local-token-change-me``
+    — the literal placeholder published in this repository's own tracked
+    ``.env.example``, in a public repo, behind a public Function URL. Access
+    logs showed no third-party IP, but the credential was public.
+
+    The root cause was structural: ``GITHUB_APP_PRIVATE_KEY``'s placeholder
+    is invalid on purpose, so forgetting to replace it fails start-up, while
+    the token placeholder was a *valid* token table and produced a working
+    server with a published credential and no signal at all. This test is the
+    regression guard for that specific string.
+    """
+    env = _valid_env(pem)
+    env["MCP_CLIENT_TOKENS"] = json.dumps(
+        {
+            "dev-local-token-change-me": {
+                "client_id": "local-dev",
+                "role": "reader",
+                "scopes": ["devoks:read"],
+            }
+        }
+    )
+
+    with pytest.raises(ConfigError, match="at least 32 characters"):
+        load_settings(env)
+
+
+@pytest.mark.parametrize("length", [1, 8, 25, 31])
+def test_tokens_below_the_floor_fail_startup(pem: str, length: int) -> None:
+    env = _valid_env(pem)
+    env["MCP_CLIENT_TOKENS"] = json.dumps(
+        {"x" * length: {"client_id": "c", "role": "reader", "scopes": ["devoks:read"]}}
+    )
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings(env)
+    message = str(excinfo.value)
+    assert "at least 32 characters" in message
+    assert f"got {length}" in message
+    # The token itself must never appear in an error that can reach a log.
+    assert "x" * length not in message
+
+
+@pytest.mark.parametrize("length", [32, 43, 64])
+def test_tokens_at_or_above_the_floor_are_accepted(pem: str, length: int) -> None:
+    env = _valid_env(pem)
+    token = "y" * length
+    env["MCP_CLIENT_TOKENS"] = json.dumps(
+        {token: {"client_id": "c", "role": "reader", "scopes": ["devoks:read"]}}
+    )
+
+    settings = load_settings(env)
+
+    assert token in settings.client_tokens
+
+
+def test_secrets_token_urlsafe_32_clears_the_floor(pem: str) -> None:
+    """The value README/`.env.example` tell operators to generate must pass.
+
+    Pinned so a future floor increase cannot silently invalidate the
+    documented recipe.
+    """
+    token = secrets.token_urlsafe(32)
+    assert len(token) >= 32
+
+    env = _valid_env(pem)
+    env["MCP_CLIENT_TOKENS"] = json.dumps(
+        {token: {"client_id": "c", "role": "reader", "scopes": ["devoks:read"]}}
+    )
+
+    assert token in load_settings(env).client_tokens
+
+
+def test_short_token_error_is_collected_with_other_config_errors(pem: str) -> None:
+    """DSN-006: all errors in one run, not one per fix-and-retry cycle."""
+    env = _valid_env(pem)
+    env["MCP_CLIENT_TOKENS"] = json.dumps(
+        {"short": {"client_id": "c", "role": "reader", "scopes": ["devoks:read"]}}
+    )
+    env["MCP_PORT"] = "not-an-int"
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings(env)
+    message = str(excinfo.value)
+    assert "at least 32 characters" in message
+    assert "MCP_PORT" in message

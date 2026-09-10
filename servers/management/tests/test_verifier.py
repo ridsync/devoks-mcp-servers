@@ -158,3 +158,47 @@ def test_get_role_returns_none_when_claims_absent() -> None:
     token = AccessToken(token="t", client_id="c1", scopes=["devoks:read"])
 
     assert get_role(token) is None
+
+
+# --- TASK-043: a non-ASCII bearer token is a 401, not a 500 ---------------------
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "토큰",  # Korean
+        "🔑",  # emoji (non-BMP)
+        "café-token-that-is-long-enough-x",  # Latin-1 supplement
+        "tok\u200bwith-zero-width-space-xx",
+    ],
+)
+async def test_non_ascii_token_is_rejected_without_raising(token: str) -> None:
+    """``secrets.compare_digest`` raises ``TypeError`` on non-ASCII ``str``.
+
+    Before TASK-043 that propagated out of ``verify_token`` as an unhandled
+    exception: HTTP **500 with a traceback** for a request whose only sin was
+    a mis-pasted ``Authorization`` header, where AC-002-2 requires a **401**.
+    The comparison now runs on UTF-8 ``bytes``, which has no ASCII
+    restriction, so every one of these is an ordinary miss.
+    """
+    verifier = StaticTableTokenVerifier(
+        {"a-registered-token-long-enough-x": ClientToken("c1", "reader", ("devoks:read",))}
+    )
+
+    assert await verifier.verify_token(token) is None
+
+
+async def test_non_ascii_token_does_not_shadow_a_real_match() -> None:
+    """The bytes comparison must not make unrelated tokens collide.
+
+    Encoding both sides could in principle map two different ``str`` values
+    onto the same ``bytes``; UTF-8 is injective, so it does not. Asserted
+    because the fix changed *what* is compared, and a fix that turned every
+    token into a match would also make the test above pass.
+    """
+    registered = "a-registered-token-long-enough-x"
+    verifier = StaticTableTokenVerifier({registered: ClientToken("c1", "reader", ("devoks:read",))})
+
+    assert (await verifier.verify_token(registered)) is not None
+    assert await verifier.verify_token(registered + "토큰") is None
+    assert await verifier.verify_token("토큰" + registered) is None

@@ -21,8 +21,8 @@ import httpx2
 import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 
+from conftest import generate_pem
 from devoks_mcp_management.adapters.knowledge.github.credentials import (
     InstallationTokenError,
     InstallationTokenProvider,
@@ -36,14 +36,15 @@ Handler = Callable[[httpx2.Request], Awaitable[httpx2.Response]]
 
 
 def _generate_pem() -> str:
-    """A throwaway RSA key generated in-process — never committed to disk."""
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pem = key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    return pem.decode("utf-8")
+    """A throwaway RSA key generated in-process — never committed to disk.
+
+    Delegates to ``conftest.generate_pem`` (TASK-047). This module keeps a
+    *function* rather than using conftest's session-scoped ``pem`` fixture
+    because three of its tests need a **fresh, distinct** key each time (they
+    assert that a JWT signed with one key does not verify against another);
+    a session-scoped fixture would hand them the same key every call.
+    """
+    return generate_pem()
 
 
 @pytest.fixture(scope="module")

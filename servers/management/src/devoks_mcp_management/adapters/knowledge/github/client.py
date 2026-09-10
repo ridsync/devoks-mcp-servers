@@ -213,6 +213,12 @@ from mcp.server.mcpserver.exceptions import ToolError
 from devoks_mcp_management.adapters.knowledge.github.credentials import InstallationTokenError
 from devoks_mcp_management.auth.policy import is_repo_allowlisted
 from devoks_mcp_management.config import Settings
+from devoks_mcp_management.types import SecurityBoundaryError
+
+#: Same shape `config.py`'s `_REPO_ALLOWLIST_ENTRY` admits — duplicated as a
+#: module-local constant rather than imported so this adapter does not depend
+#: on a private name in the config module.
+_SAFE_REPO_PATTERN: Final = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 __all__ = [
     "FileContent",
@@ -643,6 +649,22 @@ class GitHubClient:
         the module docstring for why both layers exist.
         """
         _reject_search_qualifier_injection(query)
+        # `repo` is interpolated straight into the query string below, so it
+        # is a second injection surface — and `_split_repo` is deliberately
+        # loose (it only requires a non-empty owner and name), so
+        # `"victim/x OR repo:secret"` splits happily and would reach GitHub
+        # as two qualifiers. Found while verifying TASK-049 end to end.
+        #
+        # Not reachable through the MCP surface today: `tools/guard.py`
+        # authorizes `search_code`'s `repo` against `CTR-008`, which is exact
+        # membership in a frozenset whose entries `config.py` has already
+        # validated against `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$` — a value that
+        # clears that gate cannot contain a space or a colon. This is the
+        # input-side half of the same two-layer arrangement `EDGE-013` uses
+        # (layer 1 rejects, layer 2 re-asserts after the fact), so that
+        # `GitHubClient` is safe to call directly and does not silently
+        # inherit its safety from whichever caller happens to wrap it.
+        _reject_unsafe_repo(repo)
         # `repo:{repo}` leads the query (not appended) so the server-imposed
         # scope reads as the primary qualifier and any caller-supplied text
         # is unambiguously secondary — a cosmetic/documentation-only choice
@@ -836,11 +858,15 @@ def _reject_path_traversal(value: str, *, field: str) -> None:
     configuration).
     """
     if "\\" in value:
-        raise ToolError(f"Invalid {field!r} argument: backslashes are not allowed")
+        raise SecurityBoundaryError(
+            f"Invalid {field!r} argument: backslashes are not allowed",
+            reason_code="path_traversal_attempt",
+        )
     for segment in value.split("/"):
         if segment in (".", ".."):
-            raise ToolError(
-                f"Invalid {field!r} argument: '.' and '..' path segments are not allowed"
+            raise SecurityBoundaryError(
+                f"Invalid {field!r} argument: '.' and '..' path segments are not allowed",
+                reason_code="path_traversal_attempt",
             )
 
 
@@ -871,6 +897,25 @@ def _assert_contents_url_scoped(url: str, *, owner: str, name: str) -> None:
         )
 
 
+def _reject_unsafe_repo(repo: str) -> None:
+    """`EDGE-014` companion check: reject a `repo` that is not a plain
+    ``owner/repo`` spelling before it is interpolated into a search query.
+
+    Mirrors the pattern ``config.py`` enforces on `MCP_REPO_ALLOWLIST`
+    entries, so the only values accepted here are values that *could* be
+    configured — anything carrying whitespace, a colon, or a second slash
+    (all of which GitHub's query parser would read as extra qualifiers) is
+    refused. Raises the same `SecurityBoundaryError` reason code as a
+    `query`-side injection, because it is the same attack through a
+    different parameter.
+    """
+    if not _SAFE_REPO_PATTERN.match(repo):
+        raise SecurityBoundaryError(
+            "Invalid 'repo' argument: must be a plain 'owner/repo' name",
+            reason_code="query_qualifier_injection",
+        )
+
+
 def _reject_search_qualifier_injection(query: str) -> None:
     """`EDGE-014` layer 1: reject a `search_code` `query` that tries to widen
     or redirect its scope via a GitHub search qualifier
@@ -886,13 +931,17 @@ def _reject_search_qualifier_injection(query: str) -> None:
     """
     qualifier_match = _SEARCH_QUALIFIER_PATTERN.search(query)
     if qualifier_match is not None:
-        raise ToolError(
+        raise SecurityBoundaryError(
             f"Invalid search query: {qualifier_match.group().rstrip(':')!r}-style "
             "qualifiers are not allowed; search is always scoped to the requested "
-            "repository"
+            "repository",
+            reason_code="query_qualifier_injection",
         )
     if _SEARCH_BOOLEAN_PATTERN.search(query) is not None:
-        raise ToolError("Invalid search query: top-level OR/NOT boolean operators are not allowed")
+        raise SecurityBoundaryError(
+            "Invalid search query: top-level OR/NOT boolean operators are not allowed",
+            reason_code="query_qualifier_injection",
+        )
 
 
 def _is_valid_utf8(data: bytes) -> bool:
