@@ -113,6 +113,19 @@ jobs:
   # job — the build is native and the smoke-tested container runs natively,
   # so the smoke test's timing/behavior is representative of the real
   # Fargate target instead of emulated.
+      # TASK-048 — gate on *our* dependencies, not the base image.
+      #
+      # Placed after pytest so a red build is attributable: a failure here is
+      # always "a dependency has a published fix we have not taken", never a
+      # test regression. Deliberately scoped to `uv.lock`'s pinned Python
+      # packages and to findings that *have* a fix — the container's Debian
+      # CVEs (perl-base, glibc) have no fix in trixie, and gating on those
+      # would produce a permanently red pipeline that everyone learns to
+      # ignore. See the script's own docstring for the full rationale and for
+      # why it exits 2 rather than 0 when the audit itself cannot run.
+      - name: Audit dependencies (OSV)
+        run: python3 scripts/audit-dependencies.py
+
   docker:
     name: Docker build (arm64) + /healthz smoke + ECR push
     runs-on: ubuntu-24.04-arm
@@ -310,6 +323,58 @@ jobs:
             echo ""
             echo '```'
             echo "$REGISTRY/$REPOSITORY:$SHA"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # TASK-061 — deploy the image this job just verified.
+      #
+      # Gated on the default branch, not merely on `push`: the ECR push above
+      # tags every branch build by SHA (useful for inspection), but pointing
+      # the live function at a feature branch's image would make `main` stop
+      # describing what is deployed.
+      #
+      # `update-function-code` only swaps the image; environment variables are
+      # left exactly as they are. That separation is deliberate — the two
+      # URL-dependent variables (MCP_PUBLIC_URL / MCP_ALLOWED_HOSTS) are
+      # bound to the Function URL by `infra/03-lambda.sh`'s two-phase
+      # injection, and a deploy that also rewrote configuration could silently
+      # revert them (EDGE-019: they and the Function URL host must agree, or
+      # every request is a 421).
+      #
+      # Note the cold start: the first invocation after this step pays the
+      # one-time image-optimization cost measured at ~8.5s (EDGE-016), not
+      # the ~1.9s steady-state figure.
+      - name: Deploy to Lambda
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          REPOSITORY: devoks-mcp-management
+          FUNCTION: devoks-mcp-management
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          aws lambda update-function-code \
+            --function-name "$FUNCTION" \
+            --image-uri "$REGISTRY/$REPOSITORY:$SHA" \
+            --publish \
+            --query '{Version:Version,LastUpdateStatus:LastUpdateStatus}' \
+            --output json
+
+          # Block until the new image is actually live. Without this the job
+          # goes green while the function is still `InProgress`, so a failed
+          # image swap (a bad ENTRYPOINT, a missing layer) would surface only
+          # to the next real caller.
+          aws lambda wait function-updated-v2 --function-name "$FUNCTION"
+
+          aws lambda get-function-configuration --function-name "$FUNCTION" \
+            --query '{State:State,LastUpdateStatus:LastUpdateStatus,CodeSha256:CodeSha256}' \
+            --output json
+
+          {
+            echo "### Deployed to Lambda"
+            echo ""
+            echo '```'
+            echo "$FUNCTION <- $REGISTRY/$REPOSITORY:$SHA"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

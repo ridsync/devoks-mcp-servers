@@ -158,6 +158,59 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     MCP_PORT=8000
 
+# ---------------------------------------------------------------------------
+# TASK-050 — take whatever Debian security updates exist at build time.
+#
+# WHAT THIS DOES AND DOES NOT FIX (measured, and a correction of an earlier
+# conclusion recorded in PLAN.md):
+#
+# ECR `scanOnPush` reports CRITICAL 6 / HIGH 11 on this image, all of them
+# Debian OS packages — our own Python dependencies are 0 findings (verified
+# via OSV against all 40 packages `uv.lock` pins; `scripts/audit-dependencies.py`
+# now gates that continuously). The breakdown by package:
+#
+#     perl 13 (5 CRITICAL) · glibc 2 · sqlite3 2 · gzip 2 · zlib 1 · pcre2 1
+#
+# An earlier analysis concluded "`apt-get upgrade` would fix nothing". That
+# was **partly wrong**. Re-checked against OSV per-package:
+#
+#   - sqlite3 CVE-2025-7709 is fixed in `3.46.1-7+deb13u1` — the `deb13u1`
+#     suffix means a *trixie security update*, so it is installable here.
+#   - perl's CRITICALs (CVE-2026-12087 / -13221 / -42496) are fixed only in
+#     `5.42.3-1`, which is Debian unstable; trixie ships the 5.40.x series.
+#     Not installable, at any pin.
+#   - zlib CVE-2026-27171's fix (`1:1.3.dfsg+really1.3.2-1`) is likewise
+#     unstable-only.
+#
+# So this line is worth having — it takes the sqlite3 fix today and picks up
+# every future trixie security update on rebuild, with no Dockerfile edit —
+# but it does not clear the CRITICAL count, and no amount of apt work will.
+#
+# WHY THE perl FINDINGS CANNOT BE REMOVED EITHER:
+# TASK-050's option ① was "delete unused packages such as perl". That is not
+# available: the official `python:3.14-slim-trixie` Dockerfile installs only
+# `ca-certificates`, `netbase` and `tzdata` (read from docker-library/python
+# before writing this), so `perl` is not something this image asked for — it
+# arrives as `perl-base`, which Debian marks **Essential**. Purging an
+# Essential package breaks dpkg/apt, i.e. the cure is worse than the finding.
+#
+# RESIDUAL RISK, STATED PLAINLY: these CVEs are reachable only by code
+# already executing inside the container. This server never invokes perl,
+# sqlite3, gzip or pcre2 — it is a read-only HTTP surface over four GitHub
+# tools, running as a non-root user (below) on a Lambda-managed filesystem.
+# An attacker positioned to exploit them has already achieved code execution,
+# at which point the CVE is not the primary problem. The effective control is
+# the dependency gate on the code we actually control, which is why TASK-048
+# fails the build on *those* and only warns on these.
+#
+# `--no-install-recommends` keeps the upgrade from pulling in new packages;
+# the apt lists are removed in the same layer so they do not ship.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+# ---------------------------------------------------------------------------
+
 # AC-007-1: run as a non-root, non-login system account. A fixed numeric
 # UID/GID (rather than letting `useradd --system` pick one from Debian's
 # floating system-UID range) keeps the identity reproducible across rebuilds

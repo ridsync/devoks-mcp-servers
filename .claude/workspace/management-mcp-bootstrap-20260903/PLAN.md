@@ -85,8 +85,12 @@ issue: https://github.com/ridsync/devoks-mcp-servers/issues/1
 - [x] `TASK-045` **[Low]** `_extract_str_arg`의 non-str `repo` fail-**open** → 매칭 불가 sentinel로 fail-safe 전환 — file: `tools/guard.py`
 - [x] `TASK-046` **[Low]** `MCP_CLIENT_TOKENS` 최소 길이 검증 + `.env.example`·CI 예시 갱신 + README에 `secrets.token_urlsafe(32)` 안내 — file: `config.py`
 - [x] `TASK-047` **[Low]** 테스트 픽스처 `conftest.py` 추출(`_generate_pem`·`_settings` 5개 파일 중복) — file: `servers/management/tests/conftest.py`
-- [ ] `TASK-048` Stage 2 진입 전 CI에 의존성 감사 스텝(`pip-audit` 또는 OSV 조회) 추가 — file: `.github/workflows/ci.yml`
-- [ ] `TASK-050` **[베이스 이미지 취약점]** ECR `scanOnPush`가 CRITICAL 6 / HIGH 11을 보고한다. **전부 `python:3.14-slim-trixie` 베이스의 Debian OS 패키지**이며 우리 Python 코드·의존성은 0건이다(OSV 40패키지 확인). `perl`이 21건 중 13건·CRITICAL 6건 중 5건을 차지하는데 **우리 서버는 perl을 호출하지 않는다**. Debian 보안 트래커 확인 결과 해당 CVE 전부 trixie에서 `status=open`·`fixed=-` — **`apt-get upgrade`로는 한 건도 줄지 않는다**(빌드 시간·레이어만 증가). 실효 있는 선택지: ① 미사용 패키지(`perl` 등) 제거 — CI 스모크가 검증 harness가 되므로 깨지면 즉시 드러난다 ② distroless/alpine 등 베이스 계열 전환 — musl·uv 조합 검증 필요. **현 위험 평가**: 이 CVE들은 컨테이너 안에서 이미 코드 실행이 가능한 상태를 전제하므로, 그 시점엔 CVE가 주 문제가 아니다. 배포를 막지 않되 공개 서비스로 굳히기 전에 ①을 시도할 가치가 있다 — file: `servers/management/Dockerfile`
+- [x] `TASK-048` Stage 2 진입 전 CI에 의존성 감사 스텝(`pip-audit` 또는 OSV 조회) 추가 — file: `.github/workflows/ci.yml`
+- [x] `TASK-050` **[베이스 이미지 취약점]** ECR `scanOnPush`가 CRITICAL 6 / HIGH 11을 보고한다. **전부 `python:3.14-slim-trixie` 베이스의 Debian OS 패키지**이며 우리 Python 코드·의존성은 0건이다(OSV 40패키지 확인). `perl`이 21건 중 13건·CRITICAL 6건 중 5건을 차지하는데 **우리 서버는 perl을 호출하지 않는다**. Debian 보안 트래커 확인 결과 해당 CVE 전부 trixie에서 `status=open`·`fixed=-` — **`apt-get upgrade`로는 한 건도 줄지 않는다**(빌드 시간·레이어만 증가). 실효 있는 선택지: ① 미사용 패키지(`perl` 등) 제거 — CI 스모크가 검증 harness가 되므로 깨지면 즉시 드러난다 ② distroless/alpine 등 베이스 계열 전환 — musl·uv 조합 검증 필요. **현 위험 평가**: 이 CVE들은 컨테이너 안에서 이미 코드 실행이 가능한 상태를 전제하므로, 그 시점엔 CVE가 주 문제가 아니다. 배포를 막지 않되 공개 서비스로 굳히기 전에 ①을 시도할 가치가 있다 — file: `servers/management/Dockerfile`
+  - **완료(2026-09-10) — 단, 위 분석 중 한 문장을 정정한다.** "`apt-get upgrade`로는 한 건도 줄지 않는다"가 **부분적으로 틀렸다**. OSV로 패키지별 재확인한 결과: `sqlite3` CVE-2025-7709의 수정판은 `3.46.1-7+deb13u1`로 **`deb13u1` 접미사 = trixie 보안 업데이트**이므로 설치 가능하다. 반면 `perl`의 CRITICAL 3건(CVE-2026-12087 / -13221 / -42496) 수정판은 `5.42.3-1`(Debian unstable)뿐이고 trixie는 5.40.x 계열이라 **어떤 핀으로도 설치 불가**하며, `zlib` CVE-2026-27171도 같다.
+  - **①(미사용 패키지 제거)은 실행 불가로 판명됐다.** 공식 `python:3.14-slim-trixie` Dockerfile은 `ca-certificates`·`netbase`·`tzdata`만 설치한다(docker-library/python 원문 확인) — 즉 `perl`은 이 이미지가 요청한 것이 아니라 Debian이 **Essential**로 표시한 `perl-base`로 들어온다. Essential 패키지를 purge하면 dpkg/apt가 깨진다.
+  - **채택한 조치**: 런타임 스테이지에 `apt-get upgrade`(+`--no-install-recommends`, 같은 레이어에서 apt lists 삭제). sqlite3 1건을 즉시 해소하고, **향후 trixie 보안 업데이트를 Dockerfile 수정 없이 매 재빌드에 수용**한다. CRITICAL 카운트는 이것으로 0이 되지 않으며 apt로는 될 수 없다.
+  - **잔여 위험 (명시)**: 이 CVE들은 컨테이너 안에서 이미 코드 실행이 가능한 상태를 전제한다. 이 서버는 perl·sqlite3·gzip·pcre2를 호출하지 않으며 비root로 동작한다. 실효 있는 통제는 **우리가 통제하는 코드**에 대한 게이트이고, 그래서 `TASK-048`은 우리 의존성에는 빌드를 실패시키고 이 OS CVE들에는 경고만 낸다.
 
 - [x] `TASK-049` **[관측성]** 경로 트래버설·qualifier 인젝션 시도가 감사에 `outcome=error`로 남는다(메인 루프 재검증에서 관찰). 클라이언트 입력 검증에서 나온 `ToolError`라 그렇지만, 운영자가 "allowlist 탈출 시도"를 탐지하려면 `denied`를 본다. 보안 경계 위반은 `outcome=denied` + 전용 `reason_code`(예: `path_traversal_attempt`·`query_qualifier_injection`)로 분류해 탐지 가능하게 — file: `adapters/knowledge/github/client.py`, `tools/guard.py`, `types.py`
 
@@ -225,7 +229,7 @@ Function URL: `https://zhruzqvcl52iprokp3j63ytiu40smiel.lambda-url.ap-northeast-
 - **겪은 함정 2개를 `EDGE-020`·`EDGE-021`로 기록** — Function URL 403의 원인이 권한 statement **2개** 필요(`InvokeFunctionUrl` + `InvokeFunction`)였고, 환경변수 총량 4 KB 한계가 PEM 크기와 맞물린다
 
 - [ ] `TASK-060` **[Medium]** 커스텀 도메인 `mcp.devoks.kr` — **API Gateway HTTP API**(CloudFront 아님, 근거 FRD §7·§10 Step 7). ACM 인증서(`ap-northeast-2`) + HTTP API + Lambda 프록시 통합 + 커스텀 도메인 + 가비아 CNAME 2건(ACM 검증 underscore, `mcp` → 리전 엔드포인트). 완료 후 `MCP_PUBLIC_URL`·`MCP_ALLOWED_HOSTS` 전환 — file: `infra/04-custom-domain.sh` / traces: `CTR-001`, `EDGE-018`, `EDGE-019`
-- [ ] `TASK-061` **[Small]** CI 배포 스텝 — GitHub Actions IAM 역할에 `lambda:UpdateFunctionCode` 추가(현재 ECR push 전용), 기본 브랜치 push에서만 동작하도록 게이트 — file: `.github/workflows/ci.yml`, `infra/01-ecr-and-github-oidc.sh` / traces: `AC-007-3`, FRD §10 Step 8
+- [x] `TASK-061` **[Small]** CI 배포 스텝 — GitHub Actions IAM 역할에 `lambda:UpdateFunctionCode` 추가(현재 ECR push 전용), 기본 브랜치 push에서만 동작하도록 게이트 — file: `.github/workflows/ci.yml`, `infra/01-ecr-and-github-oidc.sh` / traces: `AC-007-3`, FRD §10 Step 8
 
 ### Stage 2 착수 전 확인 (블로킹)
 
