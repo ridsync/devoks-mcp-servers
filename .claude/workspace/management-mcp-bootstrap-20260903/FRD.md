@@ -128,7 +128,7 @@ Claude Code·Codex 등 각 AgentClient와 Slack·Notion·Discord 환경이 **하
 ### 4.1 데이터 흐름 (UI 없음)
 
 ```
-AgentClient ──HTTPS──▶ [Lambda Function URL / 로컬] ──▶ Starlette app
+AgentClient ──HTTPS──▶ [API Gateway HTTP API / 로컬] ──▶ Starlette app
                                         ├─ GET  /healthz              → 200 {name, version}
                                         ├─ GET  /.well-known/oauth-protected-resource/mcp  (SDK 자동)
                                         └─ Mount /mcp → MCPServer
@@ -333,7 +333,8 @@ devoks-mcp-servers/                      # uv workspace 루트 (모노레포)
     | `2025-11-25` 이하 | **발급 + 필수** (없으면 `Missing session ID`) | **sticky session** 또는 `stateless_http=True` |
 
     SDK가 `LATEST_PROTOCOL_VERSION = 2026-07-28`을 지원하지만, **SDK 자체 클라이언트의 기본 핸드셰이크는 `2025-11-25`로 협상**된다(실측). 즉 현실의 AgentClient가 legacy 레그로 붙을 가능성이 높다. `stateless_http`는 legacy 레그 전용 플래그이고 2026-07-28 경로에서는 코드가 그 줄에 도달하지 않지만, **"켜도 의미 없다"가 아니다** — legacy 레그에서는 그것이 sticky session의 대안이다. 대가는 서버→클라이언트 역채널(sampling, push elicitation, `roots/list`)과 재개 가능성 상실이며, Stage 1 툴은 모두 단발 조회라 그 대가가 없다. **Stage 2에서 결정해야 한다**(§10).
-  - **배포 타깃 제약 (Lambda + Function URL, 2026-09-10 확정 — §10 근거):**
+  - **배포 타깃 제약 (Lambda, 2026-09-10 확정 — §10 근거):**
+    - 진입점은 **API Gateway HTTP API + 커스텀 도메인 `mcp.devoks.kr`** 하나다. 부트스트랩에 쓰던 Function URL은 **2026-09-14에 삭제**했다 — API Gateway를 우회해 스로틀링이 무력화되는 뒷문이었기 때문이다(`EDGE-022`). `Principal:"*"` 권한도 함께 회수해 누가 Function URL을 재생성해도 자동 공개되지 않는다.
     - `session_manager.run()`은 **인스턴스당 1회만** 호출 가능하다(`RuntimeError` — SDK 소스 실측). 그 안에서 `create_server`에 준 MCP 프로토콜 lifespan(`_make_github_lifespan`)이 **컨테이너 수명당 1회** 진입하고 `_handle_stateless_request`가 쓰는 anyio task group이 생긴다. LWA는 uvicorn을 정상 부팅시키므로 컨테이너 1개 = `run()` 1회로 자연 충족되지만, **Lambda 핸들러에서 앱을 재생성하는 방식으로 바꾸면 즉시 깨진다.**
     - `stateless=True`에서도 `run()`은 **여전히 필요하다** — 세션 딕셔너리만 안 쓰고 lifespan·task group은 그대로 쓴다(SDK 소스 실측). "stateless니까 lifespan 불필요"는 오독이다.
     - Lambda 실행 환경은 호출 사이에 **동결**된다. 요청 처리가 응답 반환 전에 완결돼야 하므로 `json_response=True`가 필수다(SSE 장기 스트림은 동결과 충돌).
@@ -361,6 +362,7 @@ devoks-mcp-servers/                      # uv workspace 루트 (모노레포)
 | EDGE-011 | `Host`는 허용이나 `Origin`이 미허용(브라우저 경유) | 403. 서버 로그에 사유 기록 (`AC-001-4` 계열) |
 | EDGE-016 | **콜드스타트** — 유휴 후 첫 요청이 컨테이너 초기화를 유발 | **실측 2종을 구분해야 한다**(`TASK-059`, CloudWatch `REPORT` 라인의 `Init Duration`): ① **새 이미지 배포 직후 첫 1회 = 8,511 ms** — 63 MB 이미지를 Lambda 내부 형식으로 최적화·캐싱하는 일회성 비용이다. CI 배포(`TASK-061`) 직후 첫 요청이 항상 이 값을 낸다 ② **이후 정상 상태 = ~1,900 ms**. **메모리를 올려도 개선되지 않는다** — 512 MB 1,923 ms / 1024 MB 2,007 ms / 1769 MB 1,877 ms(노이즈 범위), `Max Memory Used` 116 MB. 따라서 메모리 512 MB는 측정에 근거한 선택이며 "콜드스타트를 위해 메모리를 올린다"는 흔한 처방은 이 워크로드에 **효과가 없다**. 정상 동작으로 허용하고, 제거가 필요하면 프로비저닝 동시성(월 $5.39 실측)이 있으나 기본값은 아니다. `session_manager.run()`이 인스턴스당 1회라는 제약(§7)과 맞물리므로 **재시도로 콜드스타트를 회피하려는 로직을 추가하면 안 된다** |
 | EDGE-020 | **Function URL이 모든 요청에 403** — 리소스 정책·URL 설정이 전부 정상으로 보이는데도 | 권한 statement가 **두 개** 필요하다. 유통되는 거의 모든 예시가 `lambda:InvokeFunctionUrl` 하나만 보여주지만, 공식 문서는 "resource-based policy doesn't grant `lambda:invokeFunctionUrl` **and `lambda:InvokeFunction`** → 403 Forbidden"이라고 명시한다. 하나만 붙이면 `get-policy`·`get-function-url-config` 출력이 모두 정상이고 오류 메시지도 어느 액션이 빠졌는지 알려주지 않는다(`TASK-058`에서 실제로 겪음 — 함수 직접 호출로 LWA는 정상임을 먼저 분리 확인한 뒤 원인을 좁혔다). 두 번째 statement는 반드시 `lambda:InvokedViaFunctionUrl` 조건(`--invoked-via-function-url`)으로 **Function URL 경로에만** 한정한다 — 없으면 일반 Invoke API로도 누구나 호출 가능해진다 |
+| EDGE-022 | **공개 엔드포인트에 대한 무인증 폭주** — 인증은 막지만 비용은 막지 못한다 | 무단 요청도 **401을 내기 전에 Lambda가 호출되므로 과금**된다. 적용 전에는 스로틀링·예약 동시성·예산 알림이 모두 없어 상한이 없었다(계정 동시성 1000 × 요청당 3 ms = 이론상 초당 33만 요청). 실측 단가 기준 노출: 1억 요청 = **$175**, 10억 요청 = **$1,754**. 4중 방어로 닫는다: ① **Function URL 삭제** — 이것이 API Gateway를 **우회**하므로 먼저 없애지 않으면 나머지가 전부 무의미하다(`Principal:"*"` 권한도 함께 회수해 재생성 시 자동 공개를 막는다) ② API Gateway 스로틀링 rate 10/s·burst 20 — 429는 Lambda를 호출하지 않고 끊기므로 거절 비용이 가장 싸다 ③ 예약 동시성 10(백스톱) ④ 예산 $10 + FORECASTED 알림. **저장소 공개 여부와 무관한 문제**다 — 엔드포인트는 어느 쪽이든 인터넷에 있다 (`infra/05-abuse-protection.sh`) |
 | EDGE-021 | **Lambda 환경변수 총량 4 KB(aggregate) 초과** | 함수 생성·설정 변경이 실패한다. 실측 2,252 B / 4,096 B(55%)이고 그 중 PEM이 1,674 B다. 그래서 **기본값과 같은 선택 키는 주입하지 않는다**(`MCP_PORT`·`MCP_LOG_LEVEL`·`MCP_STATELESS_HTTP`·`MCP_JSON_RESPONSE` 등 — 6개 생략). RSA 4096비트 키(약 3,250 B)로 교체하면 총량이 3,800 B대가 되어 여유가 사라지므로, 그 시점에는 앱이 SSM을 직접 읽는 방식으로 전환해야 한다(`TASK-056`의 잔여 노출 결정과 같은 트리거) |
 | EDGE-017 | Lambda 동기 호출 **응답 페이로드 6 MB** 한계 초과 | 도달 불가 — `CTR-004` 상한이 1 MiB이고 SDK `max_request_body_size` 기본값이 4 MiB다. 단 `MCP_READ_FILE_MAX_BYTES`를 상한 밖으로 올릴 수 없게 이미 기동 검증이 막고 있다(`CTR-004` 범위 `1..1048576`). 이 경계는 **CTR-004 상한을 올리려는 향후 변경의 하드 제약**으로 기록한다 |
 | EDGE-018 | **API Gateway HTTP API 통합 타임아웃 30초(하드)** vs GitHub HTTP 타임아웃 30초 | 현재 `_GITHUB_HTTP_TIMEOUT_SECONDS = 30.0`이라 여유가 0이고, 느린 GitHub 응답이 API Gateway 504로 나가 툴 오류가 `EDGE-003`/`EDGE-009`의 정규화 경로를 타지 못한다. **GitHub 타임아웃을 20초로 낮춰** 서버가 먼저 타임아웃을 잡고 정규화된 툴 오류를 반환하게 한다. Function URL 직결(Step 5~6)에서는 15분 한계라 해당 없으나, Step 7 이후 상시 적용된다 |
@@ -409,7 +411,7 @@ devoks-mcp-servers/                      # uv workspace 루트 (모노레포)
   - 실행 역할: CloudWatch Logs 쓰기 + 위 2개 SSM 파라미터 `GetParameter` + KMS `Decrypt`만 (최소권한)
   - 로그 그룹 보존기간 설정 — CloudWatch Logs 수집은 서울에서 **$0.76/GB**(실측)로 비싼 편이라 감사 레코드 양이 늘면 체감된다. 프리티어 5 GB/월
   - 함수: ECR 이미지, `arm64`, 512 MB, 타임아웃 60초
-- [ ] **Step 5 — Function URL (`AuthType=NONE`)**
+- [x] **Step 5 — Function URL (`AuthType=NONE`)** — *부트스트랩 전용이었고 2026-09-14에 삭제됨(`EDGE-022`). 아래는 당시 근거 기록.*
   - `NONE`이 맞다 — `AWS_IAM`은 SigV4를 `Authorization` 헤더에 쓰므로 우리 Bearer 토큰과 정면 충돌한다. 인증 경계는 Stage 1에서 만든 OAuth 2.1 리소스 서버(`AC-002-*`)다
   - **2단계 주입이 필요하다** — Function URL의 `<url-id>`는 생성 시점에 결정되므로, 함수 생성 → URL 확보 → `MCP_PUBLIC_URL=https://<url-id>.lambda-url.ap-northeast-2.on.aws/mcp`·`MCP_ALLOWED_HOSTS=<url-id>.lambda-url.ap-northeast-2.on.aws` 주입 순서다(`EDGE-019`)
 - [ ] **Step 6 — 실제 MCP 클라이언트(Claude Code) E2E 검증**
@@ -424,7 +426,14 @@ devoks-mcp-servers/                      # uv workspace 루트 (모노레포)
   - GitHub Actions IAM 역할에 `lambda:UpdateFunctionCode` 추가(현재는 ECR push 전용). 기본 브랜치 push에서만 동작하도록 게이트
 - **미결 결정:**
   - 저장소를 개인 계정 `ridsync/`에서 조직 `org-devoks/`로 이관할지 (§7). 이관 시 **immutable subject claim의 소유자 ID가 바뀌므로 Step 1의 IAM 신뢰 정책을 함께 갱신**해야 한다
-  - **저장소 공개 범위** — 현재 **PUBLIC**이다(`gh repo view` 실측, description "poc : mcp-servers for agent"). PoC 단계에서는 의도된 설정일 수 있고 **자격증명 유출 위험은 없다**(시크릿은 전부 런타임 주입이며 코드·CI에 리터럴이 없음을 스캔으로 확인, `.env`는 `.dockerignore`·`.gitignore`로 차단). 다만 공개 상태에서는 **사내 저장소 allowlist 값·서비스 계층 구성·조직명이 함께 공개**되므로, 실제 사내 지식을 다루기 시작하기 전에 private 전환 여부를 판단해야 한다. CI가 arm64 러너를 **무료·무제한**으로 쓰는 근거가 public 저장소라는 점이므로(`TASK-031`), private 전환 시 러너 사용량 과금이 함께 발생한다
+  - ~~**저장소 공개 범위**~~ — **해소(2026-09-14): PUBLIC 유지로 확정.** 노출 항목을 하나씩 공격 경로 기준으로 점검한 결과 **어느 것도 보안 통제로 기능하지 않는다**:
+    - **계정 ID·역할 ARN** — 무해하다. 신뢰 정책이 `aud=sts.amazonaws.com`(StringEquals)와 **불변 subject** `repo:ridsync@8566036/devoks-mcp-servers@1355671954:*`로 고정돼 있어, 역할을 맡으려면 GitHub이 **그 저장소 ID로** OIDC 토큰을 발급해야 한다. 포크는 다른 ID를 받고, 같은 이름으로 재생성해도 ID가 다르다. **ARN을 알아도 얻는 것이 0이다.**
+    - **엔드포인트** — 공개가 정상이다. 인증 경계는 256비트 베어러 토큰이고 무단 요청은 401(실측). 브루트포스는 비현실적이다.
+    - **`org-devoks` 저장소명** — 정찰 정보일 뿐이며, GitHub App 설치 범위 + `CTR-008` 정확 일치가 실제 통제다. 이름은 통제가 아니다.
+    - **`EDGE` 21건의 재현 절차** — Kerckhoffs 원칙상 설계가 알려져도 안전해야 보안이다. 우리 방어(입력 검증·정확 일치 allowlist·토큰 인증)는 알려진다고 약해지지 않고, 회귀는 테스트 338개가 막는다.
+    - 덤으로 public이면 **Secret Scanning·Push Protection·Dependabot이 무료**다.
+    - **비용 근거도 폐기됐다** — "private 전환 시 arm64 러너 과금"이라 적었으나 GitHub이 arm64 standard 러너를 private 저장소에서 **프리티어 대상**으로 바꿨다. 실사용 측정: 33 run/11일 → 월 약 151 job-분, 프리티어 2,000분의 **7.5%** → 전환하더라도 **$0**이었다. 즉 이 항목은 애초에 비용 문제가 아니었다.
+    - **대신 진짜 문제를 찾았다** — 남용 방어 부재(`EDGE-022`). 저장소 공개 여부와 무관하며 별도로 닫았다.
   - 정적 Bearer → 사내 IdP OAuth 2.1 전환 시점과 IdP 선택 (`DSN-001`이 교체 지점을 `verifier.py`로 국소화해 둠)
   - ~~**AWS 계정 플랜(Free vs Paid)**~~ — **해소(2026-09-10)**: 계정 `703630528452`은 **Paid 플랜**이다(사용자 확인). 계정 자체는 오래 전에 생성됐고 IAM 사용자 `devoks`만 2026-09-04에 새로 만든 것 — 사용자 생성일을 계정 나이의 대리 지표로 삼은 것은 잘못된 추론이었다. 따라서 "크레딧 소진 시 계정 닫힘" 위험은 없다.
     **비용 추정에는 영향이 없다** — 월 $0.01 추정의 근거인 Lambda 프리티어(월 100만 요청 + 400,000 GB-초)는 **12개월 한정이 아니라 상시 무료(always free)**라 계정 나이와 무관하다. CloudWatch Logs 5 GB, CloudFront 1 TB도 상시 무료다. 12개월 한정인 ECR 500 MB만 만료됐을 것이므로 이미지 61.7 MB × $0.10/GB-월 = **월 $0.006**이 실제로 청구되며, 이는 §10 추정에 이미 포함돼 있다
