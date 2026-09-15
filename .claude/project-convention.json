@@ -1,0 +1,10 @@
+{
+  "preset": "custom",
+  "baseline": "python-fastapi",
+  "source": "/Users/okwon/.claude/plugins/cache/devoks-plugins/devoks-core/1.5.0/conventions/python-fastapi/project-convention.md",
+  "presetHash": "8477e8b467f7d58b70e4bfc45a8b025d6d57adc5c21f7987b70e05ee9701f384",
+  "managedBy": "devoks-core:setup-project-convention",
+  "mode": "custom-apply",
+  "customizationReason": "FastAPI/SQLAlchemy/Postgres 미사용 — 실제 스택은 mcp SDK + Starlette + AWS Lambda(uv workspace, servers/management + servers/slackbot)",
+  "appliedAt": "2026-09-15"
+}

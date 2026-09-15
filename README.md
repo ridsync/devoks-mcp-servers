@@ -3,28 +3,54 @@
 사내 프로젝트/서비스의 지식·상태를 여러 에이전트 클라이언트(Claude Code, Codex, Slackbot 등)에서
 **단일 MCP 엔드포인트**로 조회하기 위한 MCP 서버 모음(uv workspace 모노레포)이다.
 
+> **프로젝트 사실(SSOT)**: [`.claude/CLAUDE.md`](.claude/CLAUDE.md) · **작업 흐름 서술**:
+> [`docs/WORKFLOW.md`](docs/WORKFLOW.md) · **배포 도메인**: `mcp.devoks.kr`(Stage 2 완료)
+
+## 서버 개요
+
+| 서버 | 경로 | 역할 | 상태 |
+|---|---|---|---|
+| Management MCP | `servers/management/` | GitHub Knowledge 어댑터 기반 MCP 서버 | Stage 1 완료 · Stage 2 배포 완료(`mcp.devoks.kr`) |
+| Slackbot | `servers/slackbot/` | Slack Events API ↔ Claude API MCP 커넥터 브리지 | Stage 3 진행 중 (issue [#4](https://github.com/ridsync/devoks-mcp-servers/issues/4)) |
+
 이 문서는 **Management MCP 서버(Stage 1)** 기준으로 작성됐다. 요구사항·설계 결정·실측으로
 확인된 함정의 전체 근거는 워크스페이스 문서에 있다 — 이 README는 그 요약이 아니라
-**"막히는 지점을 미리 치워주는" 실행 가이드**다. Stage 2(AWS Lambda 배포)·Stage 3(Slackbot
-연동)의 잔여 작업·미결 결정은 이 문서에 복제하지 않고 아래에서 가리키기만 한다:
+**"막히는 지점을 미리 치워주는" 실행 가이드**다. Stage 3(Slackbot 연동)의 잔여 작업·미결
+결정은 이 문서에 복제하지 않고 아래에서 가리키기만 한다:
 
 - `.claude/workspace/management-mcp-bootstrap-20260903/FRD.md` — 요구사항·계약(Contract)·
-  제약·§10 Stage 2/3 로드맵
+  제약·§10 로드맵
 - `.claude/workspace/management-mcp-bootstrap-20260903/PLAN.md` — 작업 분해·진행 상태
+- `.claude/workspace/slackbot-integration-20260914/FRD.md` / `PLAN.md` — Stage 3 요구사항·
+  진행 상태(자세한 내용은 아래 "Slackbot (Stage 3)" 절 참고)
 
 ## Stage 1의 범위 — 무엇이고 무엇이 아닌지
 
 아키텍처는 AgentClient → Management MCP → **Knowledge / Runtime / Business** 3계층 어댑터로
 구성된다. **Stage 1은 이 중 Knowledge 계층의 GitHub 어댑터 하나만 구현한다.**
 
-| 계층 | Stage 1 상태 |
+```mermaid
+flowchart LR
+    AC["AgentClient<br/>(Claude Code / Codex / Slackbot)"] -->|Bearer token| MM["Management MCP<br/>servers/management"]
+    MM --> KG["Knowledge — GitHub ✅"]
+    MM -.-> KN["Knowledge — Notion 등 ❌"]
+    MM -.-> RT["Runtime — Sentry/Grafana/CI ❌"]
+    MM -.-> BZ["Business — Data API/Read DB ❌"]
+
+    SlackEvt["Slack Events API"] --> H["handler Lambda<br/>서명검증→idempotency claim"]
+    H -->|async invoke| W["worker Lambda<br/>Claude API MCP 커넥터"]
+    W --> MM
+    W --> SlackEvt
+```
+
+| 계층 | 상태 |
 |---|---|
 | Knowledge — GitHub | ✅ 구현됨 (`list_repos`, `get_repo_tree`, `read_file`, `search_code`) |
 | Knowledge — Notion, PRD/TRD 등 | ❌ 미구현 (FRD §10) |
 | Runtime — Sentry/Grafana/CloudWatch/GitHub CI | ❌ 미구현 (FRD §10) |
 | Business — Data API/Read DB/Analytics | ❌ 미구현 (FRD §10) |
-| Slackbot (MCP 클라이언트) | ❌ 미구현 — Stage 3 |
-| AWS Lambda 실배포 | 🟡 진행 중 — Stage 2. ECR 이미지 공급 경로·OIDC 완료, 런타임 전환(LWA + stateless/JSON) 완료, AWS 리소스 생성 남음. 로컬은 `uv run`, 컨테이너 기동 검증은 CI만 수행 |
+| AWS Lambda 실배포 | ✅ 완료 — Stage 2. `mcp.devoks.kr` 라이브, 오남용 방지 4중 적용 완료 |
+| Slackbot (MCP 클라이언트) | 🟡 진행 중 — Stage 3, `servers/slackbot/` 구현 중(issue #4) |
 
 Auth(Bearer 토큰 검증)·RBAC(역할×툴×저장소 인가)·Audit(감사 로그) 골격은 계층이 늘어나도
 바뀌지 않도록 Stage 1에서 이미 고정해 뒀다.
@@ -228,6 +254,29 @@ docker buildx build --platform linux/arm64 \
   실행 검증하지 못했다**(로컬 Docker 미설치) — Dockerfile 자체는 별도로 작성·정적
   검증됐다(`hadolint` 0 findings 등, 자세한 내용은 PLAN `TASK-030` 참고).
 
+## Directory Structure
+
+```
+devoks-mcp-servers/
+├── servers/
+│   ├── management/        # MCP 서버 (Stage 1, 배포 완료)
+│   │   ├── src/devoks_mcp_management/
+│   │   └── tests/
+│   └── slackbot/           # Slack↔Claude 브릿지 (Stage 3, 진행 중)
+│       ├── src/devoks_slackbot/
+│       └── tests/
+├── infra/                  # AWS 배포 스크립트 (01~05 순번)
+├── docs/WORKFLOW.md         # 작업 흐름 서술
+├── .claude/
+│   ├── CLAUDE.md            # 프로젝트 사실 SSOT
+│   ├── rules/project-convention.md  # 코딩 규범 SSOT
+│   └── workspace/           # 서버별 FRD/PLAN
+└── README.md
+```
+
+> 이 트리는 무엇이 어디 있는지만 보여준다 — 진행 상태·태스크 개수는 각 PLAN.md가 SSOT,
+> 여기 중복 기재하지 않는다(drift 방지).
+
 ## 알려진 제약
 
 - **MCP SDK는 v2(`mcp==2.1.1`)다.** v1의 `FastMCP`·`mcp.server.fastmcp.*` import 경로는
@@ -245,11 +294,24 @@ docker buildx build --platform linux/arm64 \
   1개로 유지하는 동안은 이 결정을 미룰 수 있지만, Stage 2에서 2개 이상으로 늘리는
   순간 반드시 결정해야 한다 — 자세한 내용은 FRD §7·§10.
 
-## Stage 2 · Stage 3 로드맵
+## Slackbot (Stage 3) — 진행 중
 
-이번 저장소 상태(Stage 1)에서 다음 세션이 이어받을 작업과 미결 결정 사항(Lambda
-배포 잔여 단계, 저장소 공개 범위, 정적 토큰 → OAuth 전환,
-Slackbot 연동 등)은 전부 FRD에 기록돼 있다 — 여기서 다시 나열하지 않는다:
+`servers/slackbot/`에 구현 중이다. 이 README는 아직 management 기준이라 slackbot의
+실행·환경변수·테스트 절은 다루지 않는다 — 현재 SSOT는:
+
+- `.claude/workspace/slackbot-integration-20260914/FRD.md` — 요구사항(`REQ-SB-*`)·
+  설계(`DSN-SB-*`). ID 접두 없는 `CTR-002`/`EDGE-016` 등은 Stage 1 FRD를 가리킨다.
+- `.claude/workspace/slackbot-integration-20260914/PLAN.md` — 작업 분해·진행 상태
+  (issue [#4](https://github.com/ridsync/devoks-mcp-servers/issues/4))
+
+Stage 3가 완료되면 이 절을 management와 동급의 전체 섹션(빠른 시작/환경변수/테스트)으로
+승격한다.
+
+## 로드맵 · 미결 정책
+
+Stage 1·2가 끝난 현재 상태에서 남은 미결 결정 사항(저장소 공개 범위 재검토, 정적 토큰 →
+OAuth 전환, Slackbot 연동 완료 등)은 전부 FRD에 기록돼 있다 — 여기서 다시 나열하지 않는다:
 
 → `.claude/workspace/management-mcp-bootstrap-20260903/FRD.md` §10 Roadmap
 → `.claude/workspace/management-mcp-bootstrap-20260903/PLAN.md` (작업 단위 진행 상태)
+→ `.claude/workspace/slackbot-integration-20260914/FRD.md` / `PLAN.md` (Stage 3)
