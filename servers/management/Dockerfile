@@ -105,7 +105,18 @@ WORKDIR /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --frozen --no-dev --no-install-workspace
+# --package pins this image to ONE workspace member. The root pyproject.toml has
+# no [project] table, so without it `uv sync` targets EVERY member: once
+# servers/slackbot/ landed (Stage 3 PR1) this image silently started carrying
+# anthropic, boto3, botocore and the devoks_slackbot package itself.
+# Measured in a clean environment: 41 packages / 67 MB without the flag,
+# 29 packages / 30 MB with it. Nothing imported them, so no test failed and the
+# CI build stayed green — the image just got 2.2x fatter, which costs cold-start
+# layer-fetch time and CVE-scan surface. The flag works here even though only
+# uv.lock and the root pyproject.toml are mounted at this layer (verified):
+# the lockfile already names both members. A third member would reintroduce the
+# same problem in every Dockerfile that omits this flag.
+    uv sync --frozen --no-dev --no-install-workspace --package devoks_mcp_management
 
 # --- Layer 2: the project itself, non-editable ---
 # Only now is the full (dockerignore-filtered) context copied in, so only
@@ -128,7 +139,7 @@ COPY . /app
 # marker (PEP 561) is carried into site-packages by hatchling's default
 # package-data rules — confirmed by inspecting the built wheel's file list.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev --no-editable
+    uv sync --locked --no-dev --no-editable --package devoks_mcp_management
 
 
 # ---------------------------------------------------------------------------
