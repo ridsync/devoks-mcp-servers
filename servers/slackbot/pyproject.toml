@@ -1,0 +1,55 @@
+[project]
+name = "devoks_slackbot"
+version = "0.1.0"
+description = "Slackbot — Slack Events API to Claude API MCP connector bridge (Stage 3)"
+requires-python = ">=3.14"
+dependencies = [
+    # ASGI surface. Both Lambdas run behind the Lambda Web Adapter: the handler
+    # serves the API Gateway route, the worker receives raw async-invoke payloads
+    # on AWS_LWA_PASS_THROUGH_PATH. Stage 1 got these transitively through `mcp`;
+    # this package does not depend on `mcp` (DSN-SB-002) so it declares them.
+    "starlette>=1.6.0",
+    "uvicorn>=0.52.4",
+    # DynamoDB conditional writes (idempotency) and the handler's async invoke of
+    # the worker. Measured import cost: 385 ms, plus 82 ms to build a client.
+    # That is real money against the 3-second ACK budget (CTR-SB-002) — see the
+    # note in the workspace PLAN §1. If TASK-033 measures the handler over
+    # budget, the fallback is SigV4-signed requests over httpx2 instead.
+    "boto3>=1.43.93",
+    # Slack Web API (chat.postMessage). `httpx2` — not `httpx` — is the same
+    # distribution servers/management pins, and anthropic itself requires
+    # httpx2<3,>=2.0.0, so the two agree rather than collide.
+    "httpx2>=2.5.0",
+    # Claude API with the MCP connector (CTR-SB-004). WORKER ONLY.
+    # Measured import cost: 1,384 ms. Importing this from the handler would put
+    # the handler's cold start over the 3-second budget on its own — which is
+    # exactly why DSN-SB-008 forbids it and TASK-013 enforces it with a test.
+    "anthropic>=1.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+    "pyright>=1.1.390",
+    # TASK-006: exercises real DynamoDB conditional-write semantics
+    # (ConditionalCheckFailedException) instead of a hand-rolled stub that
+    # would just be testing itself (AC-SB-003-2). Dev-only — the Dockerfile
+    # runs `uv sync --no-dev`, so this never reaches the image.
+    "moto[dynamodb]>=5.2.3",
+    # Type stubs for boto3/botocore (idempotency.py, TASK-006). Dev-only —
+    # pure type-checking aid, no runtime import.
+    "boto3-stubs[dynamodb]>=1.43.93",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/devoks_slackbot"]
+
+# No [tool.pytest.ini_options] / ruff / pyright config here — they live in the
+# workspace root pyproject.toml, same as servers/management. Duplicating them
+# per member invites the copies to drift.

@@ -4,7 +4,12 @@ members = ["servers/*"]
 [tool.ruff]
 line-length = 100
 target-version = "py314"
-src = ["servers/management/src", "servers/management/tests"]
+src = [
+    "servers/management/src",
+    "servers/management/tests",
+    "servers/slackbot/src",
+    "servers/slackbot/tests",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
@@ -13,7 +18,12 @@ select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
 quote-style = "double"
 
 [tool.pyright]
-include = ["servers/management/src", "servers/management/tests"]
+include = [
+    "servers/management/src",
+    "servers/management/tests",
+    "servers/slackbot/src",
+    "servers/slackbot/tests",
+]
 pythonVersion = "3.14"
 typeCheckingMode = "strict"
 venvPath = "."
@@ -28,5 +38,5 @@ venv = ".venv"
 # has to be the correct one, so the setting belongs where the root-level run can
 # see it.
 [tool.pytest.ini_options]
-testpaths = ["servers/management/tests"]
+testpaths = ["servers/management/tests", "servers/slackbot/tests"]
 asyncio_mode = "auto"
