@@ -28,3 +28,6 @@ build/
 .env
 .env.*
 !.env.example
+
+# infra 스크립트가 실행 시 생성하는 산출물 — 실물과 어긋날 수 있어 추적하지 않는다
+infra/*-access-policy.json
