@@ -41,7 +41,7 @@ question just asked. Stage 3's initial scope answers each question
 independently; no prior thread turns are read or sent, so cost and prompt
 size never grow with thread length.
 
-Error classification (``EDGE-SB-008``, ``AC-SB-005-3``)
+Error classification (``EDGE-SB-008``, ``EDGE-SB-017``, ``AC-SB-005-3``)
 ------------------------------------------------------------------------------
 ``ask_claude`` never raises for a Claude-API-side failure — like
 ``slack/client.py``'s ``post_message``, every outcome is normalized into the
@@ -51,8 +51,20 @@ Anthropic's error vocabulary:
 
 - **HTTP 400, ``invalid_request_error``, message starting with "You have
   reached your specified API usage limits"** — the operator's own configured
-  spend limit. **Not retryable**: this is a status set by a person and stays
-  set until they change it; retrying does not help.
+  spend limit (set in the Anthropic Console, ``EDGE-SB-017``). **Not
+  retryable**: this is a status set by a person and stays set until they
+  raise it; retrying does not help.
+- **HTTP 400, ``invalid_request_error``, message starting with "Your credit
+  balance is too low"** — the workspace has run out of prepaid credits.
+  Reproduced by hand against the real API (production incident, 2026-09):
+  ``{"type":"error","error":{"type":"invalid_request_error","message":
+  "Your credit balance is too low to access the Anthropic API. Please go to
+  Plans & Billing to upgrade or purchase credits."}}``. Classified separately
+  from the spend-limit case above (distinct ``reason_code``,
+  ``spend_limit_exceeded`` vs ``credit_exhausted``) because the operator
+  action differs — raising a self-imposed limit does nothing here; someone
+  has to add credit. **Not retryable**: no amount of retrying restores a
+  balance.
 - **HTTP 429, ``rate_limit_error``, with ``error.details.error_code ==
   "enforced_spend_limit_reached"``** — Anthropic's tier-level spend cap. Its
   ``type`` is identical to an ordinary rate limit, so without checking
@@ -71,11 +83,12 @@ Anthropic's error vocabulary:
   response. **Retryable**, and kept as two distinct reason codes for the same
   reason ``slack/client.py`` does: a caller may want a different backoff for
   each.
-- Any other HTTP status (401/403/404/other 4xx, or a 400 that isn't the spend
-  limit message) — a problem with the request/credentials itself, not
-  something a retry fixes. **Not retryable** — the conservative default,
-  same stance ``slack/client.py`` takes for a Slack error string it does not
-  recognize.
+- Any other HTTP status (401/403/404/other 4xx, or a 400 that matches neither
+  the spend-limit nor the credit-exhausted message above — including if
+  Anthropic ever changes either message's wording) — a problem with the
+  request/credentials itself, not something a retry fixes. **Not
+  retryable** — the conservative default, same stance ``slack/client.py``
+  takes for a Slack error string it does not recognize.
 
 **This module never adds its own retry loop on top of the SDK's** — it makes
 exactly one ``client.beta.messages.create`` call per ``ask_claude`` call. The
@@ -178,6 +191,17 @@ _REQUEST_TIMEOUT_SECONDS: Final = 60.0
 #: not the raw message text — confirmed by hand against the real API).
 _SPEND_LIMIT_MESSAGE_PREFIX: Final = "You have reached your specified API usage limits"
 
+#: HTTP 400 credit-exhaustion message prefix (``EDGE-SB-008``,
+#: ``EDGE-SB-017``) — reproduced by hand against the real API from a
+#: production incident, exact body:
+#: ``"Your credit balance is too low to access the Anthropic API. Please go
+#: to Plans & Billing to upgrade or purchase credits."``. Deliberately a
+#: distinct prefix from ``_SPEND_LIMIT_MESSAGE_PREFIX`` above — same HTTP
+#: status and ``invalid_request_error`` type, but a different cause (no
+#: prepaid credit left, vs. a self-imposed usage limit) with a different
+#: operator fix (purchase credit, vs. raise the limit in Console).
+_CREDIT_EXHAUSTED_MESSAGE_PREFIX: Final = "Your credit balance is too low"
+
 #: EDGE-SB-008: the one ``error.details.error_code`` value that reclassifies
 #: an HTTP 429 from an ordinary (retryable) rate limit to a tier spend cap
 #: (not retryable). See module docstring's "Error classification".
@@ -190,6 +214,7 @@ AskOutcome = Literal["answered", "refused", "error"]
 #: user-facing text (``AC-SB-005-3``).
 AskReasonCode = Literal[
     "spend_limit_exceeded",
+    "credit_exhausted",
     "rate_limited",
     "server_error",
     "timeout",
@@ -203,6 +228,13 @@ _NON_RETRYABLE_CLIENT_MESSAGE = (
 )
 _SPEND_LIMIT_CLIENT_MESSAGE = (
     "이번 달 API 사용 한도에 도달해 답변을 만들 수 없습니다. 관리자에게 문의해 주세요."
+)
+#: EDGE-SB-017: distinct from ``_SPEND_LIMIT_CLIENT_MESSAGE`` above —
+#: retrying never helps either case, but the operator fix differs (charge
+#: the workspace vs. raise a self-imposed limit), so the user-facing text
+#: says so rather than pointing at "관리자" for a generic reason.
+_CREDIT_EXHAUSTED_CLIENT_MESSAGE = (
+    "API 크레딧이 소진되어 답변을 만들 수 없습니다. 관리자에게 결제/충전을 요청해 주세요."
 )
 _REFUSAL_CLIENT_MESSAGE = "이 질문에 대한 답변이 거부되었습니다. 다른 방식으로 질문해 주세요."
 
@@ -385,6 +417,16 @@ def _classify_status_error(exc: anthropic.APIStatusError, *, question_len: int) 
             reason_code="spend_limit_exceeded",
             client_message=_SPEND_LIMIT_CLIENT_MESSAGE,
             detail="Claude API spend limit exceeded (HTTP 400, invalid_request_error)",
+        )
+
+    if exc.status_code == 400 and error_message.startswith(_CREDIT_EXHAUSTED_MESSAGE_PREFIX):
+        logger.warning("Claude API credit exhausted (status=400, question_len=%d)", question_len)
+        return AskResult(
+            outcome="error",
+            retryable=False,
+            reason_code="credit_exhausted",
+            client_message=_CREDIT_EXHAUSTED_CLIENT_MESSAGE,
+            detail="Claude API credit balance too low (HTTP 400, invalid_request_error)",
         )
 
     if exc.status_code == 429:

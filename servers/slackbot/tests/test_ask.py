@@ -309,6 +309,38 @@ async def test_ask_claude_classifies_400_spend_limit_as_non_retryable() -> None:
     await client.close()
 
 
+async def test_ask_claude_classifies_400_credit_exhausted_edge_sb_008_edge_sb_017() -> None:
+    # EDGE-SB-008 / EDGE-SB-017: exact body reproduced by hand against the
+    # real API during a production incident (see ask.py's module docstring).
+    transport = _RecordingTransport()
+    transport.queue(
+        _error_response(
+            400,
+            error_type="invalid_request_error",
+            message=(
+                "Your credit balance is too low to access the Anthropic API. "
+                "Please go to Plans & Billing to upgrade or purchase credits."
+            ),
+        )
+    )
+    client = _client(transport)
+
+    result = await ask_claude(
+        question="q",
+        mcp_server_url=TEST_MCP_SERVER_URL,
+        authorization_token=SENTINEL_MCP_TOKEN,
+        client=client,
+    )
+
+    assert result.outcome == "error"
+    assert result.reason_code == "credit_exhausted"
+    assert result.reason_code != "spend_limit_exceeded"  # distinct operator action
+    assert result.reason_code != "api_error"  # must not be lumped into the generic bucket
+    assert result.retryable is False
+    assert len(transport.requests) == 1  # no owned retry loop on top of the SDK's
+    await client.close()
+
+
 async def test_ask_claude_classifies_429_enforced_spend_limit_as_non_retryable() -> None:
     transport = _RecordingTransport()
     transport.queue(
@@ -437,6 +469,66 @@ async def test_ask_claude_classifies_other_4xx_as_non_retryable() -> None:
     await client.close()
 
 
+async def test_ask_claude_400_with_changed_credit_wording_falls_back_safely_edge_sb_008() -> None:
+    # EDGE-SB-008: if Anthropic ever rewords the credit-exhaustion message,
+    # substring matching must not raise — it should fall back to the
+    # conservative generic 400 classification, not crash or silently
+    # misclassify as retryable.
+    transport = _RecordingTransport()
+    transport.queue(
+        _error_response(
+            400,
+            error_type="invalid_request_error",
+            message="Your balance is insufficient to complete this request.",
+        )
+    )
+    client = _client(transport)
+
+    result = await ask_claude(
+        question="q",
+        mcp_server_url=TEST_MCP_SERVER_URL,
+        authorization_token=SENTINEL_MCP_TOKEN,
+        client=client,
+    )
+
+    assert result.outcome == "error"
+    assert result.reason_code == "api_error"
+    assert result.retryable is False
+    await client.close()
+
+
+async def test_ask_claude_three_400_reasons_have_distinct_client_messages_edge_sb_008() -> None:
+    # EDGE-SB-008 / AC-SB-005-3: the user needs to know *what to expect*
+    # (retry later vs. contact admin about a limit vs. contact admin about
+    # billing) — the three reason codes must not collapse to the same text.
+    async def _result_for(message: str) -> Any:
+        transport = _RecordingTransport()
+        transport.queue(_error_response(400, error_type="invalid_request_error", message=message))
+        client = _client(transport)
+        result = await ask_claude(
+            question="q",
+            mcp_server_url=TEST_MCP_SERVER_URL,
+            authorization_token=SENTINEL_MCP_TOKEN,
+            client=client,
+        )
+        await client.close()
+        return result
+
+    spend_limit_result = await _result_for("You have reached your specified API usage limits.")
+    credit_result = await _result_for("Your credit balance is too low to access the Anthropic API.")
+    generic_result = await _result_for("Some other validation error.")
+
+    messages = {
+        spend_limit_result.client_message,
+        credit_result.client_message,
+        generic_result.client_message,
+    }
+    assert len(messages) == 3  # all three distinct
+    assert spend_limit_result.reason_code == "spend_limit_exceeded"
+    assert credit_result.reason_code == "credit_exhausted"
+    assert generic_result.reason_code == "api_error"
+
+
 # --- security: no secrets/content in logs -------------------------------------
 
 
@@ -494,6 +586,47 @@ async def test_ask_claude_never_logs_secrets_or_question_on_error(
     assert result.detail is not None
     assert SENTINEL_API_KEY not in result.detail
     assert SENTINEL_MCP_TOKEN not in result.detail
+    await client.close()
+
+
+async def test_ask_claude_credit_exhausted_never_logs_secrets_or_question_edge_sb_008(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # EDGE-SB-008 / AC-SB-005-3: the new credit_exhausted path must uphold
+    # the same no-secrets guarantee as every other error path.
+    transport = _RecordingTransport()
+    transport.queue(
+        _error_response(
+            400,
+            error_type="invalid_request_error",
+            message=(
+                "Your credit balance is too low to access the Anthropic API. "
+                "Please go to Plans & Billing to upgrade or purchase credits."
+            ),
+        )
+    )
+    client = _client(transport)
+    caplog.set_level(logging.DEBUG, logger="devoks_slackbot.ask")
+
+    result = await ask_claude(
+        question=SENTINEL_QUESTION,
+        mcp_server_url=TEST_MCP_SERVER_URL,
+        authorization_token=SENTINEL_MCP_TOKEN,
+        client=client,
+    )
+
+    assert result.reason_code == "credit_exhausted"
+    assert SENTINEL_API_KEY not in caplog.text
+    assert SENTINEL_MCP_TOKEN not in caplog.text
+    assert SENTINEL_QUESTION not in caplog.text
+    assert result.detail is not None
+    assert SENTINEL_API_KEY not in result.detail
+    assert SENTINEL_MCP_TOKEN not in result.detail
+    assert result.client_message is not None
+    assert SENTINEL_API_KEY not in result.client_message
+    assert SENTINEL_MCP_TOKEN not in result.client_message
+    assert SENTINEL_API_KEY not in repr(result)
+    assert SENTINEL_MCP_TOKEN not in repr(result)
     await client.close()
 
 

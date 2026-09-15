@@ -62,6 +62,31 @@ issue: https://github.com/ridsync/devoks-mcp-servers/issues/4
   실제 Slack 워크스페이스·Anthropic 키가 없어도 서명 검증·멱등·자격·응답 구성은 전부 테스트 가능하다
   (가짜 signing secret과 mock Claude 클라이언트로 충분하다). 막히는 것은 `PR3`뿐이다.
 
+- **실환경 실측(2026-09-15, 첫 E2E):**
+
+  | 항목 | 값 | 판정 |
+  |---|---|---|
+  | handler `Init Duration` | 512 MB: **3,087 ms**(최초·이미지 pull 포함) / 1,232 ms<br>1024 MB: **1,079 ms** | `CTR-SB-002` 3,000 ms. 메모리 상향으로 CPU 구간은 12% 줄었으나 **최초 3,087 ms 는 이미지 pull 이 지배**해 메모리로 해결되지 않는다(Stage 1 `EDGE-016` 의 8,511 ms 와 같은 성질). 예산 초과 시에도 Slack 재시도를 멱등성이 걸러 답변은 한 번만 나간다 |
+  | worker 소요 | **38.1 s** / 18.6 s | `CTR-SB-009` 300 s 안. 사용자 체감은 길어 접수 알림(`AC-SB-006-4`)이 값을 한다 |
+  | 질의 비용 | input 25,251+6,569 · output 1,877+794 → **약 $0.11/건** | `EDGE-SB-017` 추정 $0.05~$0.15 **적중** |
+  | 프롬프트 캐싱 | `cache_read_input_tokens: 0` | 반복 질의가 늘면 도입 여지 |
+  | 환경변수 예산 | management 57.4% · worker 10.6% · handler 5.6% | `EDGE-021` 4 KB |
+
+  **`EDGE-SB-019` 종결** — 실 `app_mention`에서 `extract_user_id`가 `U04RS8ZPN`을 반환했다.
+  가정(`event.user`)이 실환경에서 맞았고, `authorizations[].user_id` 폴백이 없어 올바른 값이 나왔다.
+
+  **`EDGE-SB-004` 프로덕션 실증** — Slack이 같은 이벤트를 2회 보냈는데 멱등 테이블에는 1행(`completed`)뿐이고
+  답변도 한 번만 게시됐다.
+
+  **Stage 3 목적 달성 확인** — MCP 감사 레코드의 `client_id`가 `slackbot`이 아니라 **`okwon`**으로 남았고,
+  Claude가 `list_repos → get_repo_tree → search_code → read_file`을 스스로 조합했다(`DSN-SB-002`).
+  그중 `search_code` 1건이 `denied` — Stage 1 보안 경계가 실 트래픽에서 작동했다.
+
+  **구성 함정(사흘 잡아먹을 뻔한 것)** — 앱이 Bolt 에이전트 템플릿에서 만들어져 **Socket Mode가 켜져 있었다.**
+  그러면 Slack은 WebSocket으로만 이벤트를 보내고 Request URL을 무시한다. URL 검증(일회성 HTTP 핸드셰이크)은
+  성공하므로 설정이 맞아 보이는데 이벤트만 오지 않는다. `apps.manifest.export`로 `socket_mode_enabled: true`를
+  보고서야 확정했다 — 매니페스트를 먼저 봤으면 한 번에 나왔을 것이다.
+
 - **테스트 디렉터리 규약(`TASK-002`에서 발견·해결):** `servers/slackbot/tests/`에는 `__init__.py`를 **둔다**.
   워크스페이스에 `tests/conftest.py`가 둘이 되는 순간(management + slackbot), 패키지가 없으면 pytest가
   둘을 같은 bare 모듈명 `conftest`로 캐시해 **나중에 로드된 쪽이 앞을 덮어쓴다** — 재현 확인: management
@@ -129,11 +154,11 @@ issue: https://github.com/ridsync/devoks-mcp-servers/issues/4
 
 ### PR3 — 실환경 연결 · 실측 (🔴 블로커 해소 후)
 
-- [ ] `TASK-030` 🔴 **실 `app_mention` payload 1건 확인 → 매핑 키 확정** — 사용자 식별자 필드·형식을 실물로 대조하고 `TASK-004`의 추출 함수를 확정한다. 가정이 틀렸다면 **유닛테스트는 통과한 채 실환경에서 전원 미등록으로 떨어진다** — size: M — test: required — file: `servers/slackbot/src/devoks_slackbot/slack/events.py` — traces: CTR-SB-006, EDGE-SB-019
+- [x] `TASK-030` 🔴 **실 `app_mention` payload 1건 확인 → 매핑 키 확정** — 사용자 식별자 필드·형식을 실물로 대조하고 `TASK-004`의 추출 함수를 확정한다. 가정이 틀렸다면 **유닛테스트는 통과한 채 실환경에서 전원 미등록으로 떨어진다** — size: M — test: required — file: `servers/slackbot/src/devoks_slackbot/slack/events.py` — traces: CTR-SB-006, EDGE-SB-019
 - [x] `TASK-031` 🔴 시크릿 등록 — Slack Signing Secret·Bot Token·Bot User ID·Anthropic API 키를 SSM `SecureString`에 넣고 Lambda에 주입. **값은 대화·로그·커밋 어디에도 남기지 않는다** — size: M — test: skip — file: `infra/07-slackbot-lambda.sh` — traces: EDGE-SB-018
-- [ ] `TASK-032` 🔴 Slack Event Subscription URL 등록 — `url_verification` 핸드셰이크가 **서명 검증을 통과한 뒤** challenge를 반환하는지 실물 확인, `app_mention` 구독 — size: M — test: skip — file: `docs/RUNBOOK-slackbot.md` — traces: AC-SB-001-6, EDGE-SB-003
+- [x] `TASK-032` 🔴 Slack Event Subscription URL 등록 — `url_verification` 핸드셰이크가 **서명 검증을 통과한 뒤** challenge를 반환하는지 실물 확인, `app_mention` 구독 — size: M — test: skip — file: `docs/RUNBOOK-slackbot.md` — traces: AC-SB-001-6, EDGE-SB-003
 - [ ] `TASK-033` 🔴 실측 → 한도 확정 — handler `Init Duration`이 3초 예산 안인지, worker 실제 소요가 `300s/1024MB` 안인지 측정해 `CTR-SB-002`·`CTR-SB-009`를 확정한다(FRD §10 미결 1) — size: M — test: skip — file: `infra/07-slackbot-lambda.sh` — traces: CTR-SB-002, CTR-SB-009, EDGE-SB-007
-- [ ] `TASK-034` 사람별 MCP 토큰 발급 — MCP 서버 `MCP_CLIENT_TOKENS`에 사람마다 1행 추가(`CTR-002` 스키마 그대로, **서버 코드 변경 없음**) + Slackbot 매핑 반영 — size: S — test: skip — file: `infra/02-secrets.sh` — traces: CTR-SB-006, CTR-002
+- [x] `TASK-034` 사람별 MCP 토큰 발급 — MCP 서버 `MCP_CLIENT_TOKENS`에 사람마다 1행 추가(`CTR-002` 스키마 그대로, **서버 코드 변경 없음**) + Slackbot 매핑 반영 — size: S — test: skip — file: `infra/02-secrets.sh` — traces: CTR-SB-006, CTR-002
 - [ ] `TASK-035` 🔴 Claude API 비용 가드 — Anthropic Console 사용량 한도 설정(**AWS 예산 알림은 이 비용을 잡지 못한다**) + 운영 런북에 관측 레코드로 사후 집계하는 절차 기록 — size: M — test: skip — file: `docs/RUNBOOK-slackbot.md` — traces: EDGE-SB-017
 - [ ] `TASK-036` 🔴 E2E 검증 — 실제 채널에서 멘션 → 스레드 답변 게시, 미등록 사용자 거부, 재시도 중복 억제, 연타 코얼레싱, per-person 감사 레코드의 `client_id`가 사람인지 확인 — size: M — test: skip — file: `docs/RUNBOOK-slackbot.md` — traces: AC-SB-003-1, AC-SB-004-2, AC-SB-006-1, EDGE-SB-004, EDGE-SB-015, EDGE-SB-020
 
