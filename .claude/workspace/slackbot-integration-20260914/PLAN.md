@@ -121,11 +121,11 @@ issue: https://github.com/ridsync/devoks-mcp-servers/issues/4
 
 ### PR2 — 패키징 · 배포 인프라 (AWS 리소스 생성)
 
-- [ ] `TASK-020` Slackbot 컨테이너 이미지 — `servers/management/Dockerfile` 패턴 복제(arm64 · LWA 1.1.0 · 비루트 · `/healthz`), **`AWS_LWA_PASS_THROUGH_PATH` 설정**, 기본 `CMD`는 handler 팩토리 — size: M — test: skip — file: `servers/slackbot/Dockerfile` — traces: AC-SB-008-2, CTR-010, CTR-011, DSN-SB-006
-- [ ] `TASK-021` CI 확장 — `quality` 잡이 slackbot 경로도 검사하고, `docker` 잡에 slackbot 이미지 빌드 + `/healthz` 스모크 + ECR 푸시를 추가 — size: M — test: skip — file: `.github/workflows/ci.yml` — traces: AC-SB-008-3
-- [ ] `TASK-022` 멱등성 테이블 프로비저닝 — DynamoDB on-demand + TTL 속성, 최소 권한 IAM 정책 — size: M — test: skip — file: `infra/06-idempotency-table.sh` — traces: CTR-SB-007, DSN-SB-004
-- [ ] `TASK-023` Lambda 2개 프로비저닝 — 같은 이미지 + `ImageConfig.Command`로 진입점 분기, **역할별 환경변수·권한 분리**(handler는 DynamoDB+invoke, worker는 DynamoDB+SSM), worker 한도 `300s / 1024MB`, 시크릿은 SSM `SecureString`, **환경변수 4 KB 총량 확인** — size: M — test: skip — file: `infra/07-slackbot-lambda.sh` — traces: AC-SB-008-2, CTR-SB-009, EDGE-SB-012, EDGE-SB-013, EDGE-SB-016, EDGE-SB-018, DSN-SB-001, EDGE-021
-- [ ] `TASK-024` API Gateway Slack 라우트 — 기존 HTTP API에 라우트 추가, Stage 2 스로틀(`rate 10/s · burst 20`) 상속 확인, 예약 동시성 — size: M — test: skip — file: `infra/08-slackbot-route.sh` — traces: CTR-SB-002, EDGE-018, EDGE-022
+- [x] `TASK-020` Slackbot 컨테이너 이미지 — `servers/management/Dockerfile` 패턴 복제(arm64 · LWA 1.1.0 · 비루트 · `/healthz`), **`AWS_LWA_PASS_THROUGH_PATH` 설정**, 기본 `CMD`는 handler 팩토리 — size: M — test: skip — file: `servers/slackbot/Dockerfile` — traces: AC-SB-008-2, CTR-010, CTR-011, DSN-SB-006
+- [x] `TASK-021` CI 확장 — `quality` 잡이 slackbot 경로도 검사하고, `docker` 잡에 slackbot 이미지 빌드 + `/healthz` 스모크 + ECR 푸시를 추가 — size: M — test: skip — file: `.github/workflows/ci.yml` — traces: AC-SB-008-3
+- [x] `TASK-022` 멱등성 테이블 프로비저닝 — DynamoDB on-demand + TTL 속성, 최소 권한 IAM 정책 — size: M — test: skip — file: `infra/06-idempotency-table.sh` — traces: CTR-SB-007, DSN-SB-004
+- [x] `TASK-023` Lambda 2개 프로비저닝 — 같은 이미지 + `ImageConfig.Command`로 진입점 분기, **역할별 환경변수·권한 분리**(handler는 DynamoDB+invoke, worker는 DynamoDB+SSM), worker 한도 `300s / 1024MB`, 시크릿은 SSM `SecureString`, **환경변수 4 KB 총량 확인** — size: M — test: skip — file: `infra/07-slackbot-lambda.sh` — traces: AC-SB-008-2, CTR-SB-009, EDGE-SB-012, EDGE-SB-013, EDGE-SB-016, EDGE-SB-018, DSN-SB-001, EDGE-021
+- [x] `TASK-024` API Gateway Slack 라우트 — 기존 HTTP API에 라우트 추가, Stage 2 스로틀(`rate 10/s · burst 20`) 상속 확인, 예약 동시성 — size: M — test: skip — file: `infra/08-slackbot-route.sh` — traces: CTR-SB-002, EDGE-018, EDGE-022
 
 ### PR3 — 실환경 연결 · 실측 (🔴 블로커 해소 후)
 
