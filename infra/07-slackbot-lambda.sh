@@ -167,7 +167,11 @@ MCP_SERVER_URL_VALUE="${MCP_SERVER_URL:-https://mcp.devoks.kr/mcp}"
 SSM_PREFIX="/devoks-mcp/slackbot"
 
 HANDLER_TIMEOUT_SECONDS=10
-HANDLER_MEMORY_MB=512
+# 2026-09-15 실측으로 512 → 1024 상향. 최초 콜드스타트 Init Duration 이
+# 3,087 ms 로 CTR-SB-002 의 3,000 ms 예산을 넘겼다(이후 1,232 ms).
+# Lambda 는 메모리에 비례해 CPU 를 주므로 init 이 줄어든다. handler 실행
+# 자체는 3 ms 라 GB-초 증가가 사실상 없다 — 예산을 사는 가장 싼 방법이다.
+HANDLER_MEMORY_MB=1024
 WORKER_TIMEOUT_SECONDS=300
 WORKER_MEMORY_MB=1024
 ENV_BUDGET_LIMIT_BYTES=4096
