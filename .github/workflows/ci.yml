@@ -389,3 +389,334 @@ jobs:
       - name: Stop and remove container
         if: always()
         run: docker rm -f mcp-smoke || true
+
+  # -------------------------------------------------------------------------
+  # Slackbot image build (CTR-010/CTR-011, TASK-020's Dockerfile) + a
+  # container-startup smoke test against *both* entry points that one image
+  # exposes (AC-SB-008-3 handover scope) + gated ECR push/Lambda deploy.
+  #
+  # A separate job from `docker` above, not a `matrix` entry on it and not
+  # steps appended to it, for two reasons verified while writing this job:
+  #   1. `docker` above is the current production deploy path
+  #      (mcp.devoks.kr) -- left completely untouched here.
+  #   2. The two servers' smoke-test environments are large and genuinely
+  #      different (4 required keys vs. 7, split by role, plus a second
+  #      entry-point CMD override worker needs that management has no
+  #      equivalent of) -- forcing them into one `matrix` job would need a
+  #      per-entry env-var table keyed by matrix value, which reads worse
+  #      than two plain jobs for saving a few lines of shared boilerplate
+  #      (checkout, setup-buildx).
+  # Same native arm64 runner class as `docker` above, same justification (no
+  # QEMU anywhere, representative timing) -- this repository's arm64
+  # runner-minute usage is still a small fraction of the free public-repo
+  # allowance even with a second such job (handover note: ~7.5% before this
+  # addition).
+  # -------------------------------------------------------------------------
+  docker-slackbot:
+    name: Docker build (arm64) + /healthz smoke (handler+worker) + ECR push [slackbot]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Same build-context reasoning as the `docker` job's own `Build image`
+      # step (uv.lock lives at the repository root, not under
+      # servers/slackbot/) -- not repeated here.
+      # `scope=slackbot` on the gha cache keeps this job's cache entries
+      # separate from `docker`'s own (default-scope) entries -- the two
+      # Dockerfiles share almost no layers (different `--package` target,
+      # different final COPY set), so one shared scope would only add
+      # gha-cache eviction churn for no reuse benefit.
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: servers/slackbot/Dockerfile
+          platforms: linux/arm64
+          push: false
+          load: true
+          tags: devoks-slackbot:ci
+          cache-from: type=gha,scope=slackbot
+          cache-to: type=gha,mode=max,scope=slackbot
+
+      # AC-SB-008-3 / TASK-020's "ONE IMAGE, TWO LAMBDAS" -- this step proves
+      # the image's *default* `CMD` (the slack-handler entry point,
+      # `devoks_slackbot.handler:create_app`) actually starts and answers
+      # /healthz with only the handler-role required keys set
+      # (config.py's `_COMMON_REQUIRED_KEYS + _HANDLER_REQUIRED_KEYS`,
+      # verified by reading that module). Every value below is fake -- never
+      # a real Slack/Anthropic credential -- generated at runtime and passed
+      # to `docker run` via bare `-e VAR` (no `=literal` on the command
+      # line), the same pattern the `docker` job's own smoke step above uses
+      # for GITHUB_APP_PRIVATE_KEY, so nothing here needs to appear in this
+      # script's own source text to be echoed by the Actions log.
+      - name: Start slack-handler container and smoke-test /healthz
+        run: |
+          set -euo pipefail
+
+          SLACK_SIGNING_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          SLACK_BOT_TOKEN="$(python3 -c 'import secrets; print("xoxb-ci-smoke-" + secrets.token_urlsafe(24))')"
+          export SLACK_SIGNING_SECRET SLACK_BOT_TOKEN
+
+          # Identifiers, not credentials (config.py only requires non-empty
+          # strings for these) -- never sent anywhere by a /healthz-only
+          # smoke test, since that route never reaches slack/events.py or
+          # the worker dispatch call.
+          export SLACK_BOT_USER_ID="U0CISMOKE00"
+          export IDEMPOTENCY_TABLE="ci-smoke-idempotency-table"
+          export WORKER_FUNCTION_NAME="ci-smoke-worker-function"
+
+          docker run -d --name slackbot-handler-smoke -p 8080:8080 \
+            -e SLACK_SIGNING_SECRET \
+            -e SLACK_BOT_TOKEN \
+            -e SLACK_BOT_USER_ID \
+            -e IDEMPOTENCY_TABLE \
+            -e WORKER_FUNCTION_NAME \
+            devoks-slackbot:ci
+
+          status=""
+          for attempt in $(seq 1 30); do
+            if status=$(curl -s -o /tmp/slackbot-handler-healthz.json -w '%{http_code}' http://localhost:8080/healthz); then
+              if [ "$status" = "200" ]; then
+                echo "slack-handler GET /healthz -> 200 on attempt ${attempt}"
+                break
+              fi
+            fi
+            if [ "$attempt" = "30" ]; then
+              echo "::error::slack-handler container did not answer GET /healthz with 200 within 30s (last status: ${status:-<connection failed>})"
+              echo "--- docker logs slackbot-handler-smoke ---"
+              docker logs slackbot-handler-smoke || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "--- slack-handler /healthz response body ---"
+          cat /tmp/slackbot-handler-healthz.json
+          echo
+
+          # This package's /healthz body is {"status":"ok"} (handler.py's
+          # `_healthz`, read directly) -- NOT management's {"name","version"}
+          # shape above; copying that job's `grep -q '"name"'` check here
+          # would fail against a correctly-behaving container. Parsed with
+          # python's json module (not grep) so key spacing/order can't
+          # produce a false negative either way.
+          python3 -c "
+          import json, sys
+          with open('/tmp/slackbot-handler-healthz.json') as f:
+              body = json.load(f)
+          if body.get('status') != 'ok':
+              print('::error::slack-handler /healthz responded 200 but body was', body)
+              sys.exit(1)
+          "
+
+      - name: Dump slack-handler container logs (failure diagnostics)
+        if: failure()
+        run: docker logs slackbot-handler-smoke || true
+
+      - name: Stop and remove slack-handler container
+        if: always()
+        run: docker rm -f slackbot-handler-smoke || true
+
+      # TASK-023 provisions the slack-worker Lambda by overriding this same
+      # image's `CMD` via `ImageConfig.Command` -- this is the only pre-deploy
+      # proof that override actually works: `docker run`'s trailing argv
+      # after the image name replaces `CMD` outright, the exact mechanism
+      # `ImageConfig.Command` uses (verified against servers/slackbot/
+      # Dockerfile's own CMD block comment). Required keys here are
+      # `_COMMON_REQUIRED_KEYS + _WORKER_REQUIRED_KEYS` (config.py) --
+      # deliberately omits `WORKER_FUNCTION_NAME` (handler-only) to prove the
+      # worker role does not depend on it either.
+      - name: Start slack-worker container (CMD override) and smoke-test /healthz
+        run: |
+          set -euo pipefail
+
+          SLACK_SIGNING_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          SLACK_BOT_TOKEN="$(python3 -c 'import secrets; print("xoxb-ci-smoke-" + secrets.token_urlsafe(24))')"
+          ANTHROPIC_API_KEY="$(python3 -c 'import secrets; print("sk-ant-ci-smoke-" + secrets.token_urlsafe(32))')"
+          MCP_USER_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          export SLACK_SIGNING_SECRET SLACK_BOT_TOKEN ANTHROPIC_API_KEY
+
+          export SLACK_BOT_USER_ID="U0CISMOKE00"
+          export IDEMPOTENCY_TABLE="ci-smoke-idempotency-table"
+          # Must be a valid http(s) URL (config.py's `_parse_url`) -- reserved
+          # example.com domain, same choice the `docker` job above makes for
+          # MCP_PUBLIC_URL/MCP_ISSUER_URL, never a real MCP endpoint.
+          export MCP_SERVER_URL="https://ci.example.com/mcp"
+          # Must be a JSON object of non-empty string -> non-empty string
+          # (config.py's `_parse_user_token_map`) -- one fake entry satisfies
+          # startup validation; this /healthz-only smoke test never exercises
+          # the credential lookup that would actually read it.
+          export SLACK_USER_TOKEN_MAP="{\"U0CISMOKE00\":\"${MCP_USER_TOKEN}\"}"
+
+          docker run -d --name slackbot-worker-smoke -p 8080:8080 \
+            -e SLACK_SIGNING_SECRET \
+            -e SLACK_BOT_TOKEN \
+            -e SLACK_BOT_USER_ID \
+            -e IDEMPOTENCY_TABLE \
+            -e ANTHROPIC_API_KEY \
+            -e MCP_SERVER_URL \
+            -e SLACK_USER_TOKEN_MAP \
+            devoks-slackbot:ci \
+            /app/.venv/bin/uvicorn devoks_slackbot.worker:create_app --factory --host 0.0.0.0 --port 8080
+
+          status=""
+          for attempt in $(seq 1 30); do
+            if status=$(curl -s -o /tmp/slackbot-worker-healthz.json -w '%{http_code}' http://localhost:8080/healthz); then
+              if [ "$status" = "200" ]; then
+                echo "slack-worker GET /healthz -> 200 on attempt ${attempt}"
+                break
+              fi
+            fi
+            if [ "$attempt" = "30" ]; then
+              echo "::error::slack-worker container did not answer GET /healthz with 200 within 30s (last status: ${status:-<connection failed>})"
+              echo "--- docker logs slackbot-worker-smoke ---"
+              docker logs slackbot-worker-smoke || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "--- slack-worker /healthz response body ---"
+          cat /tmp/slackbot-worker-healthz.json
+          echo
+
+          python3 -c "
+          import json, sys
+          with open('/tmp/slackbot-worker-healthz.json') as f:
+              body = json.load(f)
+          if body.get('status') != 'ok':
+              print('::error::slack-worker /healthz responded 200 but body was', body)
+              sys.exit(1)
+          "
+
+      - name: Dump slack-worker container logs (failure diagnostics)
+        if: failure()
+        run: docker logs slackbot-worker-smoke || true
+
+      - name: Stop and remove slack-worker container
+        if: always()
+        run: docker rm -f slackbot-worker-smoke || true
+
+      # -----------------------------------------------------------------
+      # GATED push/deploy (AC-SB-008-3 handover: "기존 CI의 배포 경로를 탄다").
+      # The ECR repository and both Lambda functions referenced below do not
+      # exist yet (TASK-022/TASK-023 create them) -- an unconditional
+      # `if: github.event_name == 'push'` here (the `docker` job's own gate)
+      # would fail every push once this branch reaches `main`, for a reason
+      # that has nothing to do with that push's own code.
+      #
+      # Gate: repository variable `vars.SLACKBOT_DEPLOY_ENABLED`. Unset (the
+      # default -- no such variable exists yet) evaluates to an empty
+      # string, so `== 'true'` is false and every step below is skipped;
+      # the build + both smoke tests above run unconditionally either way.
+      #
+      # TO ENABLE (do this after TASK-022 + TASK-023 land, not before):
+      #   1. Verify `infra/06-idempotency-table.sh` (TASK-022) and
+      #      `infra/07-slackbot-lambda.sh` (TASK-023) created an ECR
+      #      repository and two Lambda functions under the exact names this
+      #      job's `REPOSITORY`/`HANDLER_FUNCTION`/`WORKER_FUNCTION` values
+      #      reference below -- those three names are this task's own
+      #      proposal (`devoks-slackbot` / `devoks-slack-handler` /
+      #      `devoks-slack-worker`, following the `devoks-mcp-management`
+      #      naming this repo already uses), not a value TASK-022/023 have
+      #      confirmed. Update the values below first if the provisioning
+      #      scripts used different names.
+      #   2. Verify the OIDC role assumed below (`devoks-mcp-github-actions`,
+      #      the same role the `docker` job uses for management) has been
+      #      granted `ecr:*` on the new repository and
+      #      `lambda:UpdateFunctionCode` + `lambda:GetFunctionConfiguration`
+      #      on both new functions -- this job does not create or modify
+      #      that IAM policy.
+      #   3. Repo Settings -> Secrets and variables -> Actions -> Variables
+      #      -> New repository variable: `SLACKBOT_DEPLOY_ENABLED` = `true`.
+      # -----------------------------------------------------------------
+      - name: Configure AWS credentials (OIDC)
+        if: github.event_name == 'push' && vars.SLACKBOT_DEPLOY_ENABLED == 'true'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::703630528452:role/devoks-mcp-github-actions
+          aws-region: ap-northeast-2
+
+      - name: Log in to Amazon ECR
+        if: github.event_name == 'push' && vars.SLACKBOT_DEPLOY_ENABLED == 'true'
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image to ECR
+        if: github.event_name == 'push' && vars.SLACKBOT_DEPLOY_ENABLED == 'true'
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          REPOSITORY: devoks-slackbot
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker tag devoks-slackbot:ci "$REGISTRY/$REPOSITORY:$SHA"
+          docker push "$REGISTRY/$REPOSITORY:$SHA"
+          echo "pushed $REGISTRY/$REPOSITORY:$SHA"
+
+          if [ "${{ github.ref }}" = "refs/heads/${{ github.event.repository.default_branch }}" ]; then
+            docker tag devoks-slackbot:ci "$REGISTRY/$REPOSITORY:latest"
+            docker push "$REGISTRY/$REPOSITORY:latest"
+            echo "pushed $REGISTRY/$REPOSITORY:latest"
+          else
+            echo "not the default branch - leaving :latest untouched"
+          fi
+
+          {
+            echo "### Slackbot image pushed to ECR"
+            echo ""
+            echo '```'
+            echo "$REGISTRY/$REPOSITORY:$SHA"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Same image, two Lambdas (DSN-SB-001) -- both functions are updated to
+      # the one SHA-tagged image this job just built and smoke-tested on
+      # both entry points. `update-function-code` only swaps the image,
+      # leaving each function's own `ImageConfig.Command` (TASK-023's
+      # handler/worker split) and environment variables untouched -- same
+      # reasoning the `docker` job's own "Deploy to Lambda" step documents
+      # for management.
+      - name: Deploy to Lambda (slack-handler + slack-worker)
+        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.SLACKBOT_DEPLOY_ENABLED == 'true'
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          REPOSITORY: devoks-slackbot
+          HANDLER_FUNCTION: devoks-slack-handler
+          WORKER_FUNCTION: devoks-slack-worker
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE_URI="$REGISTRY/$REPOSITORY:$SHA"
+
+          for FUNCTION in "$HANDLER_FUNCTION" "$WORKER_FUNCTION"; do
+            aws lambda update-function-code \
+              --function-name "$FUNCTION" \
+              --image-uri "$IMAGE_URI" \
+              --publish \
+              --query '{Version:Version,LastUpdateStatus:LastUpdateStatus}' \
+              --output json
+
+            aws lambda wait function-updated-v2 --function-name "$FUNCTION"
+
+            aws lambda get-function-configuration --function-name "$FUNCTION" \
+              --query '{State:State,LastUpdateStatus:LastUpdateStatus,CodeSha256:CodeSha256}' \
+              --output json
+          done
+
+          {
+            echo "### Deployed to Lambda"
+            echo ""
+            echo '```'
+            echo "$HANDLER_FUNCTION <- $IMAGE_URI"
+            echo "$WORKER_FUNCTION <- $IMAGE_URI"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
