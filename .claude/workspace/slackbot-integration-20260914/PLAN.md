@@ -130,7 +130,7 @@ issue: https://github.com/ridsync/devoks-mcp-servers/issues/4
 ### PR3 — 실환경 연결 · 실측 (🔴 블로커 해소 후)
 
 - [ ] `TASK-030` 🔴 **실 `app_mention` payload 1건 확인 → 매핑 키 확정** — 사용자 식별자 필드·형식을 실물로 대조하고 `TASK-004`의 추출 함수를 확정한다. 가정이 틀렸다면 **유닛테스트는 통과한 채 실환경에서 전원 미등록으로 떨어진다** — size: M — test: required — file: `servers/slackbot/src/devoks_slackbot/slack/events.py` — traces: CTR-SB-006, EDGE-SB-019
-- [ ] `TASK-031` 🔴 시크릿 등록 — Slack Signing Secret·Bot Token·Bot User ID·Anthropic API 키를 SSM `SecureString`에 넣고 Lambda에 주입. **값은 대화·로그·커밋 어디에도 남기지 않는다** — size: M — test: skip — file: `infra/07-slackbot-lambda.sh` — traces: EDGE-SB-018
+- [x] `TASK-031` 🔴 시크릿 등록 — Slack Signing Secret·Bot Token·Bot User ID·Anthropic API 키를 SSM `SecureString`에 넣고 Lambda에 주입. **값은 대화·로그·커밋 어디에도 남기지 않는다** — size: M — test: skip — file: `infra/07-slackbot-lambda.sh` — traces: EDGE-SB-018
 - [ ] `TASK-032` 🔴 Slack Event Subscription URL 등록 — `url_verification` 핸드셰이크가 **서명 검증을 통과한 뒤** challenge를 반환하는지 실물 확인, `app_mention` 구독 — size: M — test: skip — file: `docs/RUNBOOK-slackbot.md` — traces: AC-SB-001-6, EDGE-SB-003
 - [ ] `TASK-033` 🔴 실측 → 한도 확정 — handler `Init Duration`이 3초 예산 안인지, worker 실제 소요가 `300s/1024MB` 안인지 측정해 `CTR-SB-002`·`CTR-SB-009`를 확정한다(FRD §10 미결 1) — size: M — test: skip — file: `infra/07-slackbot-lambda.sh` — traces: CTR-SB-002, CTR-SB-009, EDGE-SB-007
 - [ ] `TASK-034` 사람별 MCP 토큰 발급 — MCP 서버 `MCP_CLIENT_TOKENS`에 사람마다 1행 추가(`CTR-002` 스키마 그대로, **서버 코드 변경 없음**) + Slackbot 매핑 반영 — size: S — test: skip — file: `infra/02-secrets.sh` — traces: CTR-SB-006, CTR-002

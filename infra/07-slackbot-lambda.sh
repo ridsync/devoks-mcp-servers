@@ -439,15 +439,64 @@ ensure_log_group "$WORKER_LOG_GROUP" slackbot-worker
 say "3-2) worker 실행 역할: $WORKER_ROLE (DynamoDB 4액션만, SSM 없음)"
 ensure_execution_role "$WORKER_ROLE" "$WORKER_LOG_GROUP" slackbot-worker worker
 
+# ---------------------------------------------------------------------------
+# create-function 은 두 가지로 실패한다. 둘 다 재실행 가능해야 한다.
+#
+# ① "The role defined for the function cannot be assumed by Lambda"
+#    방금 만든 IAM 역할이 아직 전파되지 않았다(실제로 이 스크립트 최초 실행에서
+#    발생했다). IAM 은 eventually consistent 라 기다리면 풀린다. `03-lambda.sh`
+#    는 이 대비가 없었는데 Stage 2 때는 우연히 걸리지 않았을 뿐이다.
+#
+# ② ResourceConflictException — 이미 존재한다.
+#    재실행이 곧 EDGE-SB-018 의 시크릿 회전 절차다(SSM 갱신 → 이 스크립트 재실행).
+#    그때는 코드와 설정을 각각 갱신한다. 설정 갱신이 환경변수 재주입이다.
+# ---------------------------------------------------------------------------
+create_or_update_function() {
+  local fn="$1" role="$2" mem="$3" timeout="$4" image_config="$5" env_json="$6" component="$7"
+  local err="$WORK_DIR/create-err" attempt
+  for attempt in $(seq 1 12); do
+    if aws lambda create-function --function-name "$fn" \
+         --package-type Image --code "ImageUri=$REPO_URI:$IMAGE_TAG" \
+         --role "arn:aws:iam::$ACCOUNT:role/$role" \
+         --architectures arm64 --memory-size "$mem" --timeout "$timeout" \
+         --image-config "file://$image_config" \
+         --environment "file://$env_json" \
+         --tags "Project=devoks-mcp,Component=$component" \
+         --profile "$PROFILE" --region "$REGION" >/dev/null 2>"$err"; then
+      echo "  ✅ 생성"
+      return 0
+    fi
+    if grep -q 'cannot be assumed by Lambda' "$err"; then
+      echo "  ... IAM 역할 전파 대기 ($attempt/12)"
+      sleep 5
+      continue
+    fi
+    if grep -q 'ResourceConflictException' "$err"; then
+      echo "  (이미 존재 — 코드·설정 갱신으로 전환)"
+      aws lambda update-function-code --function-name "$fn" \
+        --image-uri "$REPO_URI:$IMAGE_TAG" --publish \
+        --profile "$PROFILE" --region "$REGION" >/dev/null
+      aws lambda wait function-updated-v2 --function-name "$fn" --profile "$PROFILE" --region "$REGION"
+      aws lambda update-function-configuration --function-name "$fn" \
+        --memory-size "$mem" --timeout "$timeout" \
+        --image-config "file://$image_config" \
+        --environment "file://$env_json" \
+        --profile "$PROFILE" --region "$REGION" >/dev/null
+      aws lambda wait function-updated-v2 --function-name "$fn" --profile "$PROFILE" --region "$REGION"
+      echo "  ✅ 갱신 (환경변수 재주입 = EDGE-SB-018 회전 절차)"
+      return 0
+    fi
+    cat "$err" >&2
+    return 1
+  done
+  echo "  ❌ IAM 역할 전파가 60초 안에 끝나지 않았다 — 잠시 후 다시 실행하라" >&2
+  return 1
+}
+
 say "3-3) worker 함수 생성: $WORKER_FN (arm64, ${WORKER_TIMEOUT_SECONDS}s / ${WORKER_MEMORY_MB}MB, CTR-SB-009 초기값)"
-aws lambda create-function --function-name "$WORKER_FN" \
-  --package-type Image --code "ImageUri=$REPO_URI:$IMAGE_TAG" \
-  --role "arn:aws:iam::$ACCOUNT:role/$WORKER_ROLE" \
-  --architectures arm64 --memory-size "$WORKER_MEMORY_MB" --timeout "$WORKER_TIMEOUT_SECONDS" \
-  --image-config "file://$WORK_DIR/worker-image-config.json" \
-  --environment "file://$WORK_DIR/worker-env.json" \
-  --tags Project=devoks-mcp,Component=slackbot-worker \
-  --profile "$PROFILE" --region "$REGION" >/dev/null
+create_or_update_function "$WORKER_FN" "$WORKER_ROLE" \
+  "$WORKER_MEMORY_MB" "$WORKER_TIMEOUT_SECONDS" \
+  "$WORK_DIR/worker-image-config.json" "$WORK_DIR/worker-env.json" slackbot-worker
 
 aws lambda wait function-active-v2 --function-name "$WORKER_FN" --profile "$PROFILE" --region "$REGION"
 
@@ -461,14 +510,9 @@ say "4-2) handler 실행 역할: $HANDLER_ROLE (DynamoDB 4액션 + worker invoke
 ensure_execution_role "$HANDLER_ROLE" "$HANDLER_LOG_GROUP" slackbot-handler handler
 
 say "4-3) handler 함수 생성: $HANDLER_FN (arm64, ${HANDLER_TIMEOUT_SECONDS}s / ${HANDLER_MEMORY_MB}MB)"
-aws lambda create-function --function-name "$HANDLER_FN" \
-  --package-type Image --code "ImageUri=$REPO_URI:$IMAGE_TAG" \
-  --role "arn:aws:iam::$ACCOUNT:role/$HANDLER_ROLE" \
-  --architectures arm64 --memory-size "$HANDLER_MEMORY_MB" --timeout "$HANDLER_TIMEOUT_SECONDS" \
-  --image-config "file://$WORK_DIR/handler-image-config.json" \
-  --environment "file://$WORK_DIR/handler-env.json" \
-  --tags Project=devoks-mcp,Component=slackbot-handler \
-  --profile "$PROFILE" --region "$REGION" >/dev/null
+create_or_update_function "$HANDLER_FN" "$HANDLER_ROLE" \
+  "$HANDLER_MEMORY_MB" "$HANDLER_TIMEOUT_SECONDS" \
+  "$WORK_DIR/handler-image-config.json" "$WORK_DIR/handler-env.json" slackbot-handler
 
 aws lambda wait function-active-v2 --function-name "$HANDLER_FN" --profile "$PROFILE" --region "$REGION"
 
