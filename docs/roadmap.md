@@ -56,3 +56,35 @@
 - `.claude/workspace/slackbot-integration-20260914/FRD.md` — 사람별 MCP 토큰·감사 설계
 - `infra/11-slackbot-user-tokens.sh` — per-person 토큰 발급 스크립트(현재 읽기 전용
   토큰에 이미 적용된 패턴, write 역할에도 그대로 재사용 가능)
+
+## GitHub Actions OIDC 신뢰 범위 좁히기 — 협업자 추가 전 선행 작업
+
+### 배경 (보안 검증 결과, 2026-09-16)
+
+`infra/01-ecr-and-github-oidc.sh`의 OIDC 신뢰 정책은 저장소는 immutable ID로 정확히
+고정했지만(`repo:${OWNER}@${OWNER_ID}/${REPO}@${REPO_ID}:*`), 마지막 `:*`가 ref/environment를
+전부 허용한다. `ci.yml`은 `on: push`로 모든 브랜치에서 돌고, ECR push 스텝은
+`github.event_name == 'push'` 조건만 갖는다.
+
+### 현재 위험이 낮은 이유
+
+fork PR은 OIDC 토큰을 받지 못하므로 외부 공격자 경로는 아니다. 현재 **단일
+메인테이너 체제**라 push 권한을 가진 사람이 한 명뿐이므로 즉시 위험은 낮다. Lambda
+배포(`Deploy to Lambda` 스텝)는 default 브랜치로 이미 게이트돼 있어, 이 갭이
+실제로 열어주는 건 "임의 브랜치 push → ECR에 임의 이미지 push" 정도로 제한된다.
+
+### 협업자를 추가하기 전에 반드시 먼저 할 것
+
+push 권한을 가진 사람이 늘어나는 순간, 그 협업자(또는 그 계정이 탈취됐을 때)가
+임의 feature 브랜치를 밀어 배포 역할을 취득하고 ECR에 임의 이미지를 push할 수
+있게 된다. **협업자 추가는 다음 중 하나를 먼저 끝낸 뒤에 진행한다:**
+
+1. GitHub Environment(예: `production`)를 만들고, OIDC `sub` 조건을
+   `:environment:production`으로 좁혀 배포 관련 잡에만 이 역할을 쓰게 한다. 또는
+2. 빌드용 역할(ECR push만)과 배포용 역할(Lambda 코드 교체까지)을 분리해, 후자만
+   더 좁은 `sub` 조건을 갖게 한다.
+
+### 관련 근거
+
+- `infra/01-ecr-and-github-oidc.sh` — `OIDC_SUBJECT` 조건
+- `.github/workflows/ci.yml` — `on: push` 트리거, ECR push/Deploy to Lambda 조건

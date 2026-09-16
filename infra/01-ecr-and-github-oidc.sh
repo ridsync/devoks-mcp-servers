@@ -39,6 +39,11 @@ OWNER_NAME="${GITHUB_REPO%%/*}"
 REPO_NAME="${GITHUB_REPO##*/}"
 OIDC_SUBJECT="repo:${OWNER_NAME}@${OWNER_ID}/${REPO_NAME}@${REPO_ID}:*"
 ECR_REPO="devoks-mcp-management"
+# Same string as ECR_REPO by this project's naming convention (component name
+# reused for the ECR repo and the Lambda function alike) — kept as its own
+# variable so the IAM policy below reads as "this Lambda function", not as an
+# accidental reuse of the ECR repo name.
+FUNCTION_NAME="devoks-mcp-management"
 ROLE_NAME="devoks-mcp-github-actions"
 TAGS="Key=Project,Value=devoks-mcp Key=Stage,Value=stage2 Key=ManagedBy,Value=infra-script"
 
@@ -110,7 +115,7 @@ say "IAM role: $ROLE_NAME"
 # account's workflow from assuming this role.
 aws iam create-role \
   --role-name "$ROLE_NAME" \
-  --description "GitHub Actions OIDC - push container images to ECR (no deploy permissions)" \
+  --description "GitHub Actions OIDC - push container images to ECR + swap Lambda code (never configuration)" \
   --max-session-duration 3600 \
   --tags $TAGS \
   --assume-role-policy-document "{
@@ -126,8 +131,17 @@ aws iam create-role \
     }]
   }" --query Role.Arn --output text || echo "  (already exists)"
 
-say "Role policy: ECR push, this repository only"
-# Deliberately no ecs:* here. This identity builds and pushes; it cannot deploy.
+say "Role policy: ECR push + Lambda code swap, this repository/function only"
+# 보안 검증(2026-09-16) 발견 사항 정정: `.github/workflows/ci.yml`의 "Deploy to
+# Lambda" 스텝이 이 역할로 `devoks-mcp-management`에 `update-function-code`를
+# 실제로 실행하는데(+ `wait function-updated-v2`, `get-function-configuration`),
+# 그 권한이 이전에는 이 스크립트에도 어느 추적 스크립트에도 선언돼 있지 않았다
+# — 라이브 IAM 정책이 IaC(이 저장소의 infra/*.sh)보다 넓게 드리프트된 상태였다.
+# `SwapImageOnlyNeverConfiguration`은 `infra/10-slackbot-ecr-and-oidc.sh`가
+# slackbot 두 함수에 부여한 것과 정확히 같은 Sid·같은 액션 집합·같은 원칙이다:
+# 코드(이미지) 교체만 허용하고 `lambda:UpdateFunctionConfiguration`은 **절대**
+# 주지 않는다 — 환경변수(시크릿 포함)를 CI가 바꿀 수 있으면 안 되고, 설정
+# 변경은 `infra/03-lambda.sh`를 사람이 직접 실행하는 경로로만 한다.
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "ecr-push-${ECR_REPO}" \
@@ -141,7 +155,12 @@ aws iam put-role-policy \
         \"Action\": [ \"ecr:BatchCheckLayerAvailability\", \"ecr:InitiateLayerUpload\",
                       \"ecr:UploadLayerPart\", \"ecr:CompleteLayerUpload\", \"ecr:PutImage\",
                       \"ecr:BatchGetImage\", \"ecr:GetDownloadUrlForLayer\" ],
-        \"Resource\": \"arn:aws:ecr:${REGION}:${ACCOUNT_ID}:repository/${ECR_REPO}\" }
+        \"Resource\": \"arn:aws:ecr:${REGION}:${ACCOUNT_ID}:repository/${ECR_REPO}\" },
+      { \"Sid\": \"SwapImageOnlyNeverConfiguration\",
+        \"Effect\": \"Allow\",
+        \"Action\": [ \"lambda:UpdateFunctionCode\", \"lambda:GetFunction\",
+                      \"lambda:GetFunctionConfiguration\", \"lambda:PublishVersion\" ],
+        \"Resource\": \"arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}\" }
     ]
   }"
 echo "  attached"

@@ -21,6 +21,20 @@
 ``AWS_LWA_READINESS_CHECK_PATH``(``TASK-020``)가 폴링할 경로가 없으면 Lambda Web
 Adapter가 이 컨테이너를 절대 준비 완료로 보지 않는다.
 
+🔴 **불변식 -- 이 앱의 신뢰 경계는 Slack 서명이 아니라 AWS IAM이다.** ``POST
+/events``는 ``handler.py``와 달리 서명 검증을 하지 않는다(``handler.py``가 이미
+검증을 끝낸 뒤 ``boto3`` ``Invoke``로 전달한 페이로드만 받는다는 전제). 어느
+사용자의 MCP 토큰을 쓸지는 오직 페이로드의 ``user`` 필드로 정해진다
+(``identity.resolve_credentials``) -- 이 경로에 도달하는 모든 호출자를 그 필드가
+가리키는 사람으로 **그대로 신뢰**한다. 현재 안전한 이유는 이 함수에 Function URL도
+API Gateway 라우트도 없고, ``handler.py`` 실행 역할의 ``lambda:InvokeFunction``
+으로만 호출 가능하기 때문이다(``infra/07-slackbot-lambda.sh``,
+``infra/08-slackbot-route.sh`` 참고). **이 함수에 Function URL, API Gateway 라우트,
+EventBridge/SNS 트리거를 추가하거나 리소스 정책을 완화하지 말 것** -- 그 순간
+서명 없이 임의 ``user`` 값을 실어 보내는 것만으로 그 사람의 MCP 토큰을 도용해
+사내 저장소를 조회하고 봇 토큰으로 Slack에 게시할 수 있는 완전 무인증 경로가
+열린다(보안 검증 결과, 2026-09-16).
+
 처리 순서(FRD §4.1 worker ①~⑥, 이 워크스페이스 handover 노트의 더 세분화된 ①~⑨,
 §5.4의 상태표) -- **절대 재배치 금지**:
 

@@ -32,5 +32,16 @@ build/
 .env.*
 !.env.example
 
+# infra/03-lambda.sh · infra/07-slackbot-lambda.sh가 `--environment file://...`로
+# Lambda에 주입하기 위해 운영자가 직접 조립하는 평문 시크릿 파일(GITHUB_APP_PRIVATE_KEY
+# PEM 원문 + MCP_CLIENT_TOKENS 전체를 담는다). ENV_JSON 환경변수로 경로를 자유롭게
+# 받으므로 파일명·확장자 패턴으로 광범위하게 막는다 — .env.bak.*와 같은 근접 사고를
+# 반복하지 않기 위함(보안 검증 결과, 2026-09-16).
+lambda-env.json
+*-env.json
+*.pem
+*.key
+*credentials*.json
+
 # infra 스크립트가 실행 시 생성하는 산출물 — 실물과 어긋날 수 있어 추적하지 않는다
 infra/*-access-policy.json

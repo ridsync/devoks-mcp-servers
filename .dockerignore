@@ -5,8 +5,15 @@
 # this file lives here rather than next to the Dockerfile.
 
 # Secrets — never let a stray local .env reach the image (AC-007-4).
+# `.env.*` (not just `.env`) so a rotation/backup file (e.g. `.env.bak.*`)
+# never enters the build context either — .gitignore already ignores these
+# for git; this file must match it 1:1, since `COPY . /app` in the builder
+# stage would otherwise still pull a live secret into a build cache layer
+# (security review finding, 2026-09-16).
 .env
 **/.env
+.env.*
+**/.env.*
 
 # Local virtual environments — rebuilt inside the image by `uv sync`, and
 # copying a host-built one in (macOS arm64 Mach-O binaries, wrong Python

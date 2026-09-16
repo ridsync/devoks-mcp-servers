@@ -12,6 +12,14 @@
 #       rate 10/s·burst 20) · infra/07-slackbot-lambda.sh(`devoks-slack-handler`/
 #       `devoks-slack-worker` 함수, handler 자체 타임아웃 10s).
 #
+# 🔴 이 스크립트는 오직 `devoks-slack-handler`에만 라우트를 추가한다.
+#   `devoks-slack-worker`는 이 API(또는 다른 어떤 API Gateway·Function URL)에도
+#   절대 연결하지 않는다 — worker의 `POST /events`는 Slack 서명을 검증하지
+#   않고, handler가 검증을 끝낸 페이로드를 `lambda:InvokeFunction`으로만
+#   받는다는 전제로 안전하다(근거: `servers/slackbot/src/devoks_slackbot/
+#   worker.py` 모듈 docstring, `infra/07-slackbot-lambda.sh`의 "만들지 않는
+#   것 / 경계" 절). 보안 검증 결과, 2026-09-16.
+#
 # ----------------------------------------------------------------------------
 # 이 API를 다시 만들지 않는다 — 이름으로 조회한다
 # ----------------------------------------------------------------------------

@@ -103,10 +103,17 @@ docker buildx build --platform linux/arm64 -f servers/management/Dockerfile -t <
   - 근접 사고 이력(`TASK-046`): `.env.bak.*` 형태 백업 파일이 예전 gitignore 패턴에서
     빠져 있어 GitHub App private key가 커밋될 뻔함 → `.env.*` 전체 무시 + `!.env.example`
     예외 패턴으로 수정 완료.
+- **Lambda 배포용 평문 시크릿 파일**(`lambda-env.json` 등, `infra/03-lambda.sh`가
+  `--environment file://...`로 주입받는 형태) — `.gitignore`가 `lambda-env.json` /
+  `*-env.json` / `*.pem` / `*.key` / `*credentials*.json` 패턴으로 광범위하게 무시함
+  (보안 검증 결과, 2026-09-16 — `.env.bak.*`와 같은 유형의 근접 사고 재발 방지).
 - **필수 시크릿 값(코드/설정에 하드코딩 금지):** `GITHUB_APP_PRIVATE_KEY`, `MCP_CLIENT_TOKENS`
   (Bearer 토큰 테이블), `ANTHROPIC_API_KEY`, Slack signing secret.
 - **배포 시 주입 경로:** AWS SSM Parameter Store(SecureString, KMS `alias/aws/ssm`)에 원본
   기록 → `infra/03-lambda.sh`가 읽어 Lambda `--environment`로 주입(Lambda가 저장 시 KMS
   암호화). Secrets Manager는 쓰지 않음(`infra/02-secrets.sh` 근거 참고).
-- **저장소가 public이므로** 커밋 메시지·PR 본문·이슈에도 실제 엔드포인트/토큰/계정 식별자를
+- **저장소가 public이므로** 커밋 메시지·PR 본문·이슈에도 실제 엔드포인트·토큰·PEM을
   남기지 않도록 주의(과거 Function URL이 커밋 메시지에 노출된 근접 사고 있었음).
+  **AWS 계정 ID/ARN은 예외** — 신뢰 정책이 저장소 단위로 고정돼 있어 계정 ID 자체는
+  비밀이 아니라는 결정을 이미 내렸고(`.github/workflows/ci.yml`의 명시적 코멘트,
+  보안 검증 결과 2026-09-16 재확인), CI 로그·워크플로 파일에 이미 공개돼 있다.

@@ -134,6 +134,15 @@
 #   동시성 예산을 함께 보고 결정한다. 여기서 먼저 값을 박으면 그 판단을
 #   선점한다(`infra/06-idempotency-table.sh`가 IAM 역할 통합 여부 결정을
 #   이 태스크로 넘긴 것과 같은 이유).
+# 🔴 worker(`devoks-slack-worker`)에는 Function URL도, API Gateway 라우트도,
+#   EventBridge/SNS 등 그 어떤 공개 트리거도 **절대** 붙이지 않는다. worker의
+#   `POST /events`는 Slack 서명을 검증하지 않는다 — handler가 이미 검증을
+#   끝낸 페이로드만 `lambda:InvokeFunction`으로 넘겨받는다는 전제로만
+#   안전하다(신뢰 경계는 서명이 아니라 이 IAM 경계 그 자체 — 상세 근거는
+#   `servers/slackbot/src/devoks_slackbot/worker.py` 모듈 docstring 참고).
+#   이 경계가 뚫리면 서명 없이 임의 `user` 값 하나로 그 사람의 MCP 토큰을
+#   도용해 사내 저장소를 조회하고 봇 토큰으로 게시할 수 있는 완전 무인증
+#   경로가 열린다(보안 검증 결과, 2026-09-16).
 #
 # 사용법:  IMAGE_TAG=<커밋 SHA> ./infra/07-slackbot-lambda.sh
 #          IDEMPOTENCY_TABLE_NAME=... MCP_SERVER_URL=... (기본값 있음, 아래 참고)
