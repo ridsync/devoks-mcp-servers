@@ -85,7 +85,9 @@ docker buildx build --platform linux/arm64 -f servers/management/Dockerfile -t <
 - **진행 상태:** Stage 1(management) 완료 · Stage 2(AWS Lambda 배포) 완료(`mcp.devoks.kr` 라이브,
   오남용 방지 4중 적용 완료) · Stage 3(slackbot) 진행 중.
 - **SSOT 문서:**
-  - `README.md` — 빠른 시작·환경변수·실행 가이드(Stage 1 기준)
+  - `README.md` — 프로젝트 개요·아키텍처·디렉토리 구조·기술 스택 가이드(진입점)
+  - `docs/management-guide.md` — management 실행·환경변수·MCP 클라이언트 등록·컨테이너 빌드
+  - `docs/slackbot-guide.md` — slackbot 처리 흐름·멱등성·배포 인프라
   - `docs/WORKFLOW.md` — 전체 작업 흐름(왜 이 순서, 무엇이 실측으로 뒤집혔는지)
   - `.claude/workspace/management-mcp-bootstrap-20260903/{FRD,PLAN}.md` — Stage 1/2 요구사항·
     설계(DSN)·계약(CTR)·엣지케이스(EDGE)·태스크(TASK), ID 접두 없음
