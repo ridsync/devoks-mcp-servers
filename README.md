@@ -3,6 +3,10 @@
 사내 프로젝트/서비스의 지식·상태를 여러 에이전트 클라이언트(Claude Code, Codex, Slackbot 등)에서
 **단일 MCP 엔드포인트**로 조회하기 위한 MCP 서버 모음(uv workspace 모노레포)입니다.
 
+![devoks-mcp-servers](docs/images/devoks-mcp-hero-emerald-grid-title.png)
+
+---
+
 ## 프로젝트 구성
 
 | 서버 | 경로 | 설명 |
