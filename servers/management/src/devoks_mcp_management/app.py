@@ -1,96 +1,37 @@
-"""ASGI composition root: Starlette(``/healthz`` + ``Mount /mcp``) + lifespan (TASK-009).
+"""ASGI 조립 루트: Starlette(`/healthz` + `Mount /mcp`) + lifespan (TASK-009).
 
-``create_app(settings) -> Starlette`` is a **factory**, mirroring
-``server.create_server``'s own module docstring rationale: nothing at module
-scope builds a ``Settings`` or a ``Starlette`` app, so importing this module
-never needs a populated environment and never raises ``ConfigError``.
+`create_app(settings) -> Starlette`는 **팩토리**다 — 모듈 스코프에 `Settings`나
+`Starlette` 앱을 만들지 않으므로, import만으로는 환경변수를 읽거나 `ConfigError`가
+나지 않는다. 실제 진입점은 `create_app_from_env`(uvicorn/컨테이너가 호출) 하나뿐이다.
 
-``create_app_from_env`` is the process entry point uvicorn/the container
-actually run — see its docstring for the exact invocation. TASK-030
-(Dockerfile), TASK-031 (CI smoke test), and TASK-032 (README) all point at
-this function; changing its name or signature is a breaking change for them.
+라우트 조립(CTR-001) — `routes=` 건드리기 전에 읽을 것
+--------------------------------------------------------
+`mcp.streamable_http_app()`이 반환하는 앱은 자체 라우트 `/mcp` 외에, `token_verifier=`·
+`auth=`를 함께 주면 SDK가 RFC 9728 Protected Resource Metadata 라우트도 추가한다
+(`mcp==2.1.1` 실측 확인). 그 경로가 `/.well-known/oauth-protected-resource/mcp`로
+정확히 떨어지려면 `MCP_PUBLIC_URL`에 `/mcp` path가 trailing slash 없이 있어야 한다
+(세 가지 형태 전부 실측 검증 — `config.py` 참고).
 
-Route assembly (CTR-001) — read before touching the ``routes=`` list
-----------------------------------------------------------------------
-``mcp.streamable_http_app()`` already returns a complete ``Starlette`` app
-whose own route is ``/mcp`` (``streamable_http_path`` defaults to that) plus,
-because ``server.create_server`` always supplies both ``token_verifier=`` and
-``auth=``, a second route the SDK adds itself: RFC 9728 Protected Resource
-Metadata at ``/.well-known/oauth-protected-resource`` + the *path component*
-of ``settings.public_url`` (verified against the installed ``mcp==2.1.1``,
-``mcp.server.auth.routes.create_protected_resource_routes`` /
-``build_resource_metadata_url``). For that to land on the fixed
-``/.well-known/oauth-protected-resource/mcp`` path CTR-001 requires,
-``MCP_PUBLIC_URL`` must itself carry a ``/mcp`` path **with no trailing
-slash**: ``https://mcp.example.com/mcp``, not
-``https://mcp.example.com/mcp/`` (produces
-``.../oauth-protected-resource/mcp/``, an extra trailing slash CTR-001 does
-not have) and not the bare domain ``https://mcp.example.com`` (produces
-``.../oauth-protected-resource`` with no ``/mcp`` suffix at all — verified
-empirically against all three shapes, not merely inferred). This is
-independent of anything in this file; it is a property of the value
-operators put in ``MCP_PUBLIC_URL`` (**see handover notes for TASK-032's
-``.env.example``**).
+이 때문에 MCP 서브앱을 `/mcp`가 아니라 **루트(`Mount("/", ...)`)에** 마운트한다 —
+`/mcp`에 마운트하면 서브앱 자체 경로와 겹쳐 `/mcp/mcp`가 된다(SDK 공식 문서에
+명시된 함정). `Mount("/")`는 모든 경로를 먼저 잡아먹으므로 **`/healthz`는 반드시
+그 앞에 나열**한다.
 
-Given that, this module mounts the MCP sub-app at the *root* —
-``Mount("/", app=mcp.streamable_http_app(...))`` — not at ``Mount("/mcp",
-...)``. Mounting at ``/mcp`` would double the prefix (the sub-app's own route
-is already ``/mcp``), producing ``/mcp/mcp`` and
-``/mcp/.well-known/oauth-protected-resource/mcp`` — silently breaking both
-CTR-001 and AC-002-4. This exact trap, and the ``Mount("/", ...)`` fix, is
-documented at
-<https://py.sdk.modelcontextprotocol.io/run/asgi/index.md#mounting-it>.
-Because ``Mount("/")`` matches every path, ``/healthz`` is listed *before*
-it in ``routes=`` — Starlette tries routes in list order, and anything after
-a ``Mount("/")`` is unreachable.
+Lifespan(DSN-004) — 서로 다른 lifespan 2개가 얽혀 있다
+--------------------------------------------------------
+1. **ASGI/transport lifespan** — 이 모듈의 `lifespan()`. `mcp.session_manager.run()`을
+   연다. 마운트된 서브앱의 자체 lifespan은 Starlette가 호출하지 않으므로, 호스트 앱인
+   여기서 명시적으로 열어야 한다 — 생략하면 `/mcp` 첫 요청이
+   `RuntimeError: Task group is not initialized`로 죽는다.
+2. **MCP 프로토콜 lifespan** — `create_server(settings, lifespan=...)`로 전달한
+   `_github_lifespan`. `mcp.session_manager.run()`을 여는 순간 이것도 같은
+   `async with` 안에서 함께 열린다(설치된 `mcp==2.1.1` 소스로 확인) — 별도
+   `AsyncExitStack`을 두 lifespan에 걸쳐 공유할 필요가 없다.
 
-Lifespan (DSN-004) — two distinct "lifespan"s, both live here now
--------------------------------------------------------------------
-There are **two** distinct "lifespan"s in play, and TASK-023 wires both:
-
-1. **The ASGI/transport lifespan** — entered below, in this module's
-   ``lifespan()``. It owns ``mcp.session_manager.run()``, the StreamableHTTP
-   session manager's background task group. Skipping this is not a style
-   choice: the SDK's own docs warn that mounting the MCP sub-app *disables*
-   the built-in lifespan ``streamable_http_app()`` wires into the object it
-   returns (a mounted sub-application's lifespan is never invoked by
-   Starlette), so the **host** app — this one — must enter it explicitly, or
-   the first request to ``/mcp`` fails with ``RuntimeError: Task group is
-   not initialized``.
-2. **The MCP protocol lifespan** — the ``lifespan=`` keyword
-   ``MCPServer.__init__`` accepts (see ``mcp.server.mcpserver.server``),
-   forwarded through ``server.create_server(settings, lifespan=...)``
-   (TASK-023). This is the one that populates
-   ``ctx.request_context.lifespan_context`` inside a tool function (see
-   ``tools/registry.py``'s module docstring for the exact shape TASK-022's
-   tools expect, and ``adapters/knowledge/github/tools.py``'s
-   ``GitHubToolContext`` for this module's half of that contract).
-
-**These do not need a shared ``AsyncExitStack`` spanning both** — reading
-``mcp.server.streamable_http_manager.StreamableHTTPSessionManager.run()`` in
-the installed ``mcp==2.1.1`` shows it does ``async with
-self.app.lifespan(self.app) as lifespan_state, anyio.create_task_group() as
-tg:`` where ``self.app`` is the low-level ``Server`` wrapped by
-``lifespan_wrapper`` around whatever was passed as ``MCPServer(...,
-lifespan=...)``. In other words, entering ``mcp.session_manager.run()``
-(transport lifespan, #1, below) **already enters the MCP-protocol lifespan
-(#2) as part of the same ``async with``**, once, for the process's lifetime
-— ``lifespan()`` below needs no change of shape to pick up #2; it only needs
-``create_server`` to be called with one.
-
-``_github_lifespan`` (built by ``_make_github_lifespan``, below) is the
-``lifespan=`` value handed to ``create_server``. Its own body is where
-``contextlib.AsyncExitStack`` actually does its job — constructing the
-shared ``httpx2.AsyncClient`` (DSN-004: exactly one, injected into both the
-token provider and the GitHub REST client), then the token provider, then
-the client, registering each resource's cleanup immediately after
-constructing it so a mid-construction exception (or, ordinarily, process
-shutdown) unwinds only what was actually built, in reverse order. No GitHub
-network call happens anywhere in this path — token issuance is lazy, inside
-``InstallationTokenProvider.get_token()``, the first time a tool actually
-calls GitHub — so a GitHub outage can never turn into a failed server
-startup here; only a genuine local construction failure (there currently is
-none) would.
+`_make_github_lifespan`이 실제로 자원을 만드는 순서(모두 `AsyncExitStack`으로 등록,
+역순 정리): ① 공유 `httpx2.AsyncClient` 1개(DSN-004) → ② `InstallationTokenProvider`
+→ ③ `GitHubClient`. GitHub 호출은 어디서도 즉시 일어나지 않는다(토큰 발급은 지연
+평가) — 그래서 GitHub 장애가 서버 기동 실패로 번지지 않는다.
 """
 
 from __future__ import annotations
@@ -117,93 +58,82 @@ from devoks_mcp_management.adapters.knowledge.github.credentials import Installa
 from devoks_mcp_management.config import Settings, load_settings
 from devoks_mcp_management.server import SERVER_NAME, create_server
 
-#: Must match ``[project].name`` in ``servers/management/pyproject.toml`` —
-#: that is the distribution name ``importlib.metadata`` looks up, not the
-#: importable package name (they happen to be spelled the same here).
+#: `servers/management/pyproject.toml`의 `[project].name`과 일치해야 한다 —
+#: `importlib.metadata`가 조회하는 건 배포판 이름이지 임포트 패키지 이름이
+#: 아니다(여기선 우연히 철자가 같음).
 _DISTRIBUTION_NAME = "devoks_mcp_management"
 
-#: Network timeout for the one shared ``httpx2.AsyncClient`` this lifespan
-#: builds (DSN-004) — applies to every GitHub REST call made through it
-#: (connect/read/write/pool alike; ``httpx2.AsyncClient(timeout=<float>)``
-#: applies one bound to all four). ``httpx2.AsyncClient()``'s own default is
-#: ``Timeout(timeout=5.0)`` (verified against the installed ``httpx2>=2.5.0``
-#: package) — tight enough that an ordinary GitHub slow patch (paginated
-#: ``list_installation_repositories`` across many pages, or a large file read
-#: through the ``EDGE-012`` raw-media-type fallback) could spuriously fail a
-#: tool call. Leaving the client's timeout unset entirely is not the fix
-#: either: this process runs as an ECS task, and a connection that never
-#: times out can wedge that task's request-handling indefinitely on a single
-#: stalled GitHub call. 30s is the explicit middle ground — generous enough
-#: to absorb realistic GitHub latency without another retry layer, short
-#: enough that a genuinely stuck connection still surfaces as an ordinary
-#: ``ToolError`` (via ``client.py``'s own ``httpx2.HTTPError`` handling)
-#: within one request's lifetime rather than hanging it forever.
-# EDGE-018: kept strictly *below* the fronting layer's own ceiling so this
-# server is always the one that times out first. API Gateway HTTP API's
-# integration timeout is a hard 30s maximum (configurable 50–30,000 ms, not
-# raisable), so an equal 30.0 here left zero headroom: a slow GitHub reply
-# would surface as an API Gateway 504 that never passes through this
-# server's own error normalization (EDGE-003 rate-limit hint / EDGE-009
-# tool-error shaping), losing the audit record's `error_kind` too.
+#: 이 lifespan이 만드는 공유 `httpx2.AsyncClient` 하나의 네트워크
+#: 타임아웃(DSN-004) — connect/read/write/pool 전부에 동일하게 적용된다
+#: (`httpx2.AsyncClient(timeout=<float>)`는 하나의 값으로 네 개를 다 묶는다).
+#: `httpx2.AsyncClient()` 기본값은 `Timeout(timeout=5.0)`(설치된
+#: `httpx2>=2.5.0` 패키지로 확인) — 페이지가 많은
+#: `list_installation_repositories`나 `EDGE-012` raw-media-type 폴백의
+#: 대용량 파일 읽기 같은 평범한 GitHub 지연에도 툴 호출이 헛되이 실패할 만큼
+#: 빠듯하다. 타임아웃을 아예 안 두는 것도 답이 아니다 — 이 프로세스는 ECS
+#: task라 멈춘 GitHub 커넥션 하나가 task 전체 요청 처리를 무한정 막을 수
+#: 있다. 30초는 명시적 중간값 — 재시도 계층 없이 현실적인 GitHub 지연을
+#: 흡수할 만큼 넉넉하고, 진짜로 멈춘 커넥션은 요청 수명 안에서 평범한
+#: `ToolError`로(`client.py`의 `httpx2.HTTPError` 처리 경유) 드러날 만큼 짧다.
+# EDGE-018: 앞단 레이어의 한도보다 반드시 낮게 유지 — 이 서버가 항상 먼저
+# 타임아웃해야 한다. API Gateway HTTP API의 integration timeout은 30초가
+# 하드 맥스(50~30,000ms 설정 가능, 그 이상 불가)라 여기를 30.0으로 같게
+# 두면 여유가 0이 된다 — 느린 GitHub 응답이 이 서버의 에러
+# 정규화(EDGE-003 rate-limit 힌트 / EDGE-009 tool-error 가공)를 거치지
+# 못한 채 API Gateway 504로 나가 감사 레코드의 `error_kind`까지 유실된다.
 _GITHUB_HTTP_TIMEOUT_SECONDS: Final = 20.0
 
 
 @dataclass(frozen=True, slots=True)
 class GitHubLifespanContext:
-    """The MCP-protocol lifespan value this app yields (DSN-004, AC-006-1).
+    """이 앱이 yield하는 MCP 프로토콜 lifespan 값(DSN-004, AC-006-1).
 
-    Structurally satisfies ``adapters.knowledge.github.tools.GitHubToolContext``
-    — that module's own ``_require_lifespan`` re-validates both attribute
-    names and types with ``isinstance`` at call time (its docstring explains
-    why), so this dataclass does not need to inherit from that ``Protocol``;
-    matching its two attribute names and types exactly is what makes the
-    match. Frozen, matching this project's convention for every other
-    constructed-once value (``config.Settings``, ``client.py``'s return
-    types, ...).
+    `adapters.knowledge.github.tools.GitHubToolContext`를 구조적으로
+    만족한다 — 그 모듈의 `_require_lifespan`이 호출 시점에 속성 이름·타입을
+    `isinstance`로 다시 검증하므로(이유는 그 docstring 참고) 이 dataclass가
+    그 `Protocol`을 상속할 필요는 없다 — 속성 이름·타입 두 개가 정확히
+    일치하면 된다. 다른 1회성 생성 값(`config.Settings`, `client.py` 반환
+    타입 등)과 같은 이 프로젝트 관례대로 frozen.
     """
 
     github: GitHubClient
     repo_allowlist: frozenset[str]
 
 
-#: The exact shape ``MCPServer(..., lifespan=...)`` (and, forwarded,
-#: ``server.create_server(..., lifespan=...)``) needs — named so
-#: ``_make_github_lifespan``'s own return type stays under this project's
-#: line-length limit.
+#: `MCPServer(..., lifespan=...)`(그리고 그대로 전달되는
+#: `server.create_server(..., lifespan=...)`)가 요구하는 정확한 타입 —
+#: `_make_github_lifespan` 반환 타입이 이 프로젝트의 line-length 제한을
+#: 넘지 않도록 이름을 붙였다.
 _GitHubLifespan = Callable[
     [MCPServer[GitHubLifespanContext]], AbstractAsyncContextManager[GitHubLifespanContext]
 ]
 
 
 def _make_github_lifespan(settings: Settings) -> _GitHubLifespan:
-    """Build the MCP-protocol ``lifespan=`` value for ``create_server`` (DSN-004).
+    """`create_server`용 MCP 프로토콜 `lifespan=` 값을 만든다(DSN-004).
 
-    Returns a fresh async-context-manager factory closed over ``settings`` —
-    not the entered context manager itself — because ``MCPServer(...,
-    lifespan=...)`` needs a *callable* it invokes itself once
-    ``mcp.session_manager.run()`` starts (see the module docstring's
-    "Lifespan" section for exactly when that happens).
+    이미 진입한 context manager가 아니라 `settings`를 클로저로 감싼 새
+    async-context-manager 팩토리를 반환한다 — `MCPServer(..., lifespan=...)`는
+    `mcp.session_manager.run()`이 시작될 때 스스로 호출할 *callable*이
+    필요하기 때문(정확한 시점은 모듈 docstring "Lifespan" 절 참고).
 
-    Construction order and cleanup, once entered
-    -----------------------------------------------
-    1. One ``httpx2.AsyncClient`` (``_GITHUB_HTTP_TIMEOUT_SECONDS``) — the
-       single instance DSN-004 requires shared between the token provider and
-       the GitHub REST client. Its ``aclose()`` is registered with the exit
-       stack immediately, before anything else is built.
-    2. ``InstallationTokenProvider.from_settings(settings, http_client=...)``
-       — never calls GitHub itself (token issuance is lazy; see module
-       docstring). Its ``aclose()`` (drops only its own cached token state,
-       never the injected client — see that module's own docstring) is
-       registered immediately after.
-    3. ``GitHubClient.from_settings(settings, http_client=..., token_provider=...)``
-       — has no ``aclose()`` of its own (it owns no resource beyond the
-       shared client and the provider, both already covered above).
+    생성 순서와 정리(진입 후)
+    --------------------------
+    1. `httpx2.AsyncClient` 1개(`_GITHUB_HTTP_TIMEOUT_SECONDS`) — DSN-004가
+       요구하는, token provider와 GitHub REST client가 공유하는 단일
+       인스턴스. `aclose()`를 다른 무엇보다 먼저 exit stack에 등록한다.
+    2. `InstallationTokenProvider.from_settings(settings, http_client=...)`
+       — GitHub를 직접 호출하지 않음(토큰 발급은 지연 평가, 모듈 docstring
+       참고). `aclose()`(자신의 캐시된 토큰 상태만 버리고 주입된 client는
+       건드리지 않음 — 해당 모듈 docstring 참고)를 바로 이어서 등록한다.
+    3. `GitHubClient.from_settings(settings, http_client=..., token_provider=...)`
+       — 자체 `aclose()` 없음(공유 client와 provider 외에 소유한 자원이 없음,
+       둘 다 위에서 이미 커버됨).
 
-    ``AsyncExitStack`` unwinds in reverse registration order on exit *or* on
-    an exception raised partway through this sequence — so ``provider.aclose()``
-    always runs before ``http_client.aclose()`` (the ordering TASK-023's
-    handover notes require), and a failure after step 1 still closes the
-    client that step already opened rather than leaking it.
+    `AsyncExitStack`은 종료 시 *또는* 이 시퀀스 도중 예외가 나도 등록 역순으로
+    해제한다 — 그래서 `provider.aclose()`는 항상 `http_client.aclose()`보다
+    먼저 실행되고(TASK-023 handover 노트가 요구하는 순서), 1단계 이후
+    실패해도 그 단계가 이미 연 client는 누수 없이 닫힌다.
     """
 
     @asynccontextmanager
@@ -227,14 +157,13 @@ def _make_github_lifespan(settings: Settings) -> _GitHubLifespan:
 
 
 def _server_version() -> str:
-    """Package version for the ``/healthz`` body (AC-001-3).
+    """`/healthz` 응답 본문용 패키지 버전(AC-001-3).
 
-    Sourced from installed package metadata rather than a hardcoded literal
-    so the two can never drift. The ``PackageNotFoundError`` fallback is
-    defensive only — every supported run path (``uv sync`` locally, the
-    container image) installs this distribution with metadata — but a
-    missing distribution must never turn a public, unauthenticated health
-    check into a 500.
+    하드코딩 리터럴이 아니라 설치된 패키지 메타데이터에서 가져와 둘이
+    드리프트할 일이 없다. `PackageNotFoundError` 폴백은 방어용일 뿐 — 지원되는
+    모든 실행 경로(로컬 `uv sync`, 컨테이너 이미지)가 메타데이터와 함께 이
+    배포판을 설치하지만, 배포판이 없다고 해서 공개·비인증 health check가
+    500이 되어서는 안 된다.
     """
     try:
         return _package_version(_DISTRIBUTION_NAME)
@@ -243,24 +172,19 @@ def _server_version() -> str:
 
 
 def _expand_allowed_hosts(hosts: tuple[str, ...]) -> list[str]:
-    """Derive ``TransportSecuritySettings.allowed_hosts`` from ``Settings.allowed_hosts``.
+    """`Settings.allowed_hosts`로부터 `TransportSecuritySettings.allowed_hosts`를 만든다.
 
-    ``allowed_hosts`` entries are matched by exact string equality against
-    the request's ``Host`` header (verified against
-    ``mcp.server.transport_security.TransportSecurityMiddleware._validate_host``
-    in the installed ``mcp==2.1.1``) — a bare ``"mcp.example.com"`` entry
-    matches only a portless ``Host`` header, and only a literal
-    ``"mcp.example.com:*"`` entry matches one with a port. A request's actual
-    ``Host`` header can carry a port or not depending on what sits in front
-    of this server (a local ``uvicorn`` run almost always includes one; an
-    ALB in front of a standard 443/80 listener usually does not) — the
-    SDK's own deploy guide lists both forms side by side for exactly this
-    reason. Rather than push that duplication onto every value of
-    ``MCP_ALLOWED_HOSTS`` (DSN-007: this is an env-injected list, so every
-    redundant entry is an extra thing to get right *and* keep in sync across
-    environments), each configured host is expanded to both forms here,
-    unless it already specifies a port (contains ``:``) — an operator who
-    deliberately pins a host to a fixed port meant only that port to match.
+    `allowed_hosts` 항목은 요청 `Host` 헤더와 완전 문자열 일치로 매칭된다
+    (설치된 `mcp==2.1.1`의 `TransportSecurityMiddleware._validate_host`
+    소스로 확인) — 맨 `"mcp.example.com"`은 포트 없는 `Host` 헤더만,
+    `"mcp.example.com:*"`는 포트 있는 헤더만 매칭한다. 실제 `Host` 헤더의
+    포트 유무는 앞단 구성에 달렸다(로컬 `uvicorn`은 거의 항상 포함, 표준
+    443/80 리스너 앞 ALB는 보통 없음) — SDK 배포 가이드도 이 이유로 두
+    형태를 나란히 제시한다. 이 중복을 `MCP_ALLOWED_HOSTS`(DSN-007: env로
+    주입되는 리스트라 중복 항목마다 맞추고 환경 간 동기화할 거리가 늘어남)
+    값마다 떠넘기는 대신, 이미 포트를 명시한(`:` 포함) 경우가 아니면 여기서
+    설정된 host마다 두 형태로 확장한다 — 운영자가 의도적으로 고정 포트를
+    박았다면 그 포트만 매칭되길 원한 것이므로 제외한다.
     """
     expanded: list[str] = []
     for host in hosts:
@@ -271,77 +195,73 @@ def _expand_allowed_hosts(hosts: tuple[str, ...]) -> list[str]:
 
 
 async def _healthz(request: Request) -> JSONResponse:
-    """GET /healthz (CTR-001, AC-001-3) — unauthenticated by design.
+    """GET /healthz (CTR-001, AC-001-3) — 설계상 비인증.
 
-    An ALB/orchestrator health check never carries a Bearer token, so this
-    route sits directly on the outer Starlette app, outside the MCP sub-app
-    ``Mount`` entirely — it never passes through ``TransportSecurity`` or
-    ``TokenVerifier``. The body is intentionally minimal (name + version
-    only): this is a public endpoint, so it must never echo back
-    ``Settings`` or any other configuration value.
+    ALB/오케스트레이터 health check는 Bearer 토큰을 싣지 않으므로 이
+    라우트는 MCP 서브앱 `Mount` 바깥, 바깥쪽 Starlette 앱에 직접 둔다 —
+    `TransportSecurity`나 `TokenVerifier`를 전혀 거치지 않는다. 응답 본문은
+    의도적으로 최소(name + version만) — 공개 엔드포인트이므로 `Settings`나
+    다른 설정값을 절대 되돌려주지 않는다.
     """
     return JSONResponse({"name": SERVER_NAME, "version": _server_version()})
 
 
 def create_app(settings: Settings) -> Starlette:
-    """Build one Starlette app wired for CTR-001's three routes, from ``settings``.
+    """`settings`로부터 CTR-001의 세 라우트를 갖춘 Starlette 앱 하나를 만든다.
 
-    A factory, not a module-level singleton — see the module docstring.
-    Call this once per process (or once per ``Settings`` in a test); nothing
-    here is safe or unsafe to call twice, it just builds independent objects
-    each time, the same guarantee ``server.create_server`` already gives.
+    모듈 스코프 싱글턴이 아니라 팩토리 — 모듈 docstring 참고. 프로세스당 한
+    번(테스트에선 `Settings`당 한 번) 호출한다 — 두 번 호출해도 안전/위험
+    여부는 없고 매번 독립된 객체를 만들 뿐이다(`server.create_server`와 같은
+    보장).
     """
     mcp = create_server(settings, lifespan=_make_github_lifespan(settings))
 
-    # Root logger *threshold* only, not a second logging.basicConfig(...):
-    # create_server() -> MCPServer.__init__() already called
-    # mcp.server.mcpserver.utilities.logging.configure_logging("INFO") (an
-    # SDK-internal, hardcoded default — server.py has no parameter to
-    # override it), which calls logging.basicConfig(...) and installs the
-    # root logger's handlers. basicConfig() only takes effect on a root
-    # logger that has no handlers yet, so calling it again here would
-    # silently do nothing. setLevel() changes the threshold regardless of
-    # who installed the handlers, which is what actually makes
-    # MCP_LOG_LEVEL affect server-log verbosity (e.g. the transport
-    # security middleware's Host/Origin rejection warnings, AC-001-4). This
-    # is deliberately separate from audit logging (audit/logger.py writes
-    # its JSON line straight to stdout, bypassing the logging module
-    # entirely) — an operator raising MCP_LOG_LEVEL never filters audit
-    # records, only this server-log stream.
+    # root logger *threshold*만 바꾼다 — 두 번째 logging.basicConfig(...)가
+    # 아니다: create_server() -> MCPServer.__init__()이 이미
+    # mcp.server.mcpserver.utilities.logging.configure_logging("INFO")를
+    # 호출했다(SDK 내부 하드코딩 기본값 — server.py엔 오버라이드 파라미터가
+    # 없음). 이게 logging.basicConfig(...)를 호출해 root logger 핸들러를
+    # 설치한다. basicConfig()는 핸들러가 아직 없는 root logger에만 효과가
+    # 있어 여기서 다시 불러도 조용히 아무 일도 안 한다. setLevel()은 누가
+    # 핸들러를 설치했든 threshold를 바꾸므로, 이게 실제로 MCP_LOG_LEVEL이
+    # 서버 로그 verbosity(예: transport security 미들웨어의 Host/Origin
+    # 거부 경고, AC-001-4)에 영향을 주는 방식이다. 감사 로깅(audit/logger.py는
+    # logging 모듈을 완전히 우회해 JSON 줄을 stdout에 직접 씀)과는
+    # 의도적으로 분리돼 있다 — 운영자가 MCP_LOG_LEVEL을 올려도 감사 레코드는
+    # 절대 필터되지 않고, 이 서버 로그 스트림만 영향받는다.
     logging.getLogger().setLevel(settings.log_level)
 
     security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=_expand_allowed_hosts(settings.allowed_hosts),
-        # EDGE-011 / DSN-007: CTR-006 (FRD §5.2) defines no env key for a
-        # browser-facing Origin allowlist, and this task is explicitly not
-        # authorized to add one (a new env key is an FRD contract change —
-        # see the handover notes for what the main loop needs to decide).
-        # An empty list is the safe default in the meantime:
-        # TransportSecurityMiddleware only checks Origin when the header is
-        # present at all (same-origin requests and every non-browser MCP
-        # client never send one, per
-        # mcp.server.transport_security.TransportSecurityMiddleware._validate_origin),
-        # so this blocks browser-based callers outright — the conservative
-        # direction — rather than guessing at an allowlist nobody
-        # configured. Stage 1 has no browser client in FRD §2's context.
+        # EDGE-011 / DSN-007: CTR-006(FRD §5.2)은 브라우저 대상 Origin
+        # allowlist용 env 키를 정의하지 않고, 이 태스크는 새 키를 추가할
+        # 권한이 없다(새 env 키는 FRD 계약 변경 — 메인 루프가 결정할 사항은
+        # handover 노트 참고). 그동안은 빈 리스트가 안전한 기본값이다:
+        # TransportSecurityMiddleware는 Origin 헤더가 있을 때만 검사하므로
+        # (동일 출처 요청과 브라우저가 아닌 모든 MCP 클라이언트는 Origin을
+        # 보내지 않음,
+        # mcp.server.transport_security.TransportSecurityMiddleware._validate_origin
+        # 기준) 아무도 설정하지 않은 allowlist를 추측하는 대신 브라우저
+        # 기반 호출을 그냥 차단한다 — 보수적인 방향. FRD §2 맥락상 Stage
+        # 1엔 브라우저 클라이언트가 없다.
         allowed_origins=[],
     )
 
-    # CTR-011 / FRD §7 "배포 타깃 제약": both flags come from settings so the
-    # one image runs on Lambda (both True — the default) and, unchanged,
-    # behind a sticky-session load balancer (both False).
+    # CTR-011 / FRD §7 "배포 타깃 제약": 두 플래그 모두 settings에서 오므로
+    # 같은 이미지가 Lambda(둘 다 True — 기본값)와, 변경 없이 sticky-session
+    # 로드밸런서 뒤(둘 다 False)에서 각각 돌아간다.
     #
-    # `stateless_http=True` does NOT remove the need for the `lifespan()`
-    # below. Verified against the installed mcp==2.1.1 source:
-    # `StreamableHTTPSessionManager.run()` is what enters the MCP-protocol
-    # lifespan (`_make_github_lifespan`, passed to `create_server` above) and
-    # creates the anyio task group that `_handle_stateless_request` starts
-    # each per-request transport in. Stateless mode only stops the manager
-    # from tracking `_server_instances`/`_session_owners`; it does not make
-    # `run()` optional. `run()` also raises RuntimeError if called twice per
-    # instance, which is why the app must be built once per process (uvicorn
-    # boots it once per container) and never per Lambda invocation.
+    # `stateless_http=True`라도 아래 `lifespan()`이 필요 없어지지 않는다.
+    # 설치된 mcp==2.1.1 소스로 확인: MCP 프로토콜 lifespan(위에서
+    # `create_server`에 넘긴 `_make_github_lifespan`)을 여는 건
+    # `StreamableHTTPSessionManager.run()`이고, `_handle_stateless_request`가
+    # 요청마다 여는 transport의 anyio task group도 이게 만든다. stateless
+    # 모드는 매니저가 `_server_instances`/`_session_owners`를 추적하지
+    # 않게만 할 뿐 `run()`을 선택적으로 만들지 않는다. `run()`은 인스턴스당
+    # 두 번 호출되면 RuntimeError도 던진다 — 그래서 앱은 프로세스당 한 번만
+    # 만들어야 하고(uvicorn은 컨테이너당 한 번 기동), Lambda invocation마다
+    # 만들면 안 된다.
     mcp_app = mcp.streamable_http_app(
         transport_security=security,
         stateless_http=settings.stateless_http,
@@ -350,22 +270,21 @@ def create_app(settings: Settings) -> Starlette:
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncGenerator[None]:
-        """Enter/exit the StreamableHTTP session manager for the app's lifetime.
+        """앱 수명 동안 StreamableHTTP session manager를 열고 닫는다.
 
-        See the module docstring ("Lifespan (DSN-004)") for why this specific
-        line is required once the MCP app is *mounted* rather than run
-        standalone, and for why entering it also enters the MCP-protocol
-        lifespan ``create_server`` was given above (``_make_github_lifespan``)
-        — nothing further needs to happen in this function for TASK-023.
+        MCP 앱을 독립 실행이 아니라 *마운트*했을 때 왜 이 한 줄이 필요한지,
+        이걸 여는 게 왜 위에서 `create_server`에 준 MCP 프로토콜 lifespan
+        (`_make_github_lifespan`)도 함께 여는지는 모듈 docstring("Lifespan
+        (DSN-004)") 참고 — TASK-023을 위해 이 함수에서 더 할 일은 없다.
         """
         async with mcp.session_manager.run():
             yield
 
     return Starlette(
         routes=[
-            # Must precede the Mount("/", ...) below: Starlette matches
-            # routes in list order, and Mount("/") matches every path, so
-            # anything listed after it is unreachable.
+            # 아래 Mount("/", ...)보다 반드시 앞에 와야 한다 — Starlette는
+            # 리스트 순서대로 라우트를 매칭하고 Mount("/")는 모든 경로를
+            # 잡아먹어서, 그 뒤에 나열된 건 도달 불가능해진다.
             Route("/healthz", endpoint=_healthz, methods=["GET"]),
             Mount("/", app=mcp_app),
         ],
@@ -374,15 +293,14 @@ def create_app(settings: Settings) -> Starlette:
 
 
 def create_app_from_env(env: Mapping[str, str] | None = None) -> Starlette:
-    """Process entry point: ``uvicorn devoks_mcp_management.app:create_app_from_env --factory``.
+    """프로세스 진입점: `uvicorn devoks_mcp_management.app:create_app_from_env --factory`.
 
-    Chosen over a lazily-evaluated module-level ``app = create_app(...)``
-    attribute so that **importing this module never reads the environment
-    or can raise ``ConfigError``** — only calling this function does. This
-    is the exact entry point TASK-030 (Dockerfile ``CMD``), TASK-031 (CI
-    health-check smoke test), and TASK-032 (README run instructions) are
-    expected to invoke; ``env`` defaults to ``os.environ`` and exists only
-    so a caller (a future ``__main__``, a test) can inject a different
-    mapping without mutating process state.
+    지연 평가되는 모듈 레벨 `app = create_app(...)` 속성 대신 이 방식을 택해
+    **이 모듈을 import하는 것만으로는 환경을 읽거나 `ConfigError`가 나지
+    않는다** — 이 함수를 호출해야만 그렇다. TASK-030(Dockerfile `CMD`),
+    TASK-031(CI health-check smoke test), TASK-032(README 실행 안내)가
+    호출하도록 기대되는 바로 그 진입점이다. `env`는 기본값이 `os.environ`이고,
+    호출부(미래의 `__main__`, 테스트)가 프로세스 상태를 바꾸지 않고 다른
+    매핑을 주입할 수 있도록만 존재한다.
     """
     return create_app(load_settings(env if env is not None else os.environ))

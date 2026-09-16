@@ -1,85 +1,55 @@
-"""Core 4 GitHub MCP tools: argument schemas and response transformation (TASK-022).
+"""GitHub MCP 툴 4종의 인자 스키마와 응답 변환(TASK-022).
 
-`register(mcp, guard) -> None` is this module's export, per `tools/registry.py`'s
-contract — `server.create_server` calls it once (through `tools.registry.register_tools`)
-with a `Guard` already built from that server instance's `Settings`.
+`register(mcp, guard) -> None`이 이 모듈의 진입점 — `tools/registry.py` 계약대로
+`server.create_server`가 서버 인스턴스의 `Settings`로 만든 `Guard`를 넘겨 1회
+호출한다.
 
-Tool functions are defined **undecorated** at module scope and only wrapped with
-`guard(...)` inside `register()`, never with a bare `@guard(...)` atop the `def`.
-`guard` does not exist at import time — it is `tools.guard.make_tool_guard(settings)`'s
-return value, built once per server instance from that instance's `Settings`
-(see `tools/guard.py`'s "Why a factory" and `tools/registry.py`'s "Dependency timing"
-sections) — so decoration has to happen at `register()`'s call time, not at module
-definition time.
+Tool 함수는 모듈 스코프에 **데코레이터 없이** 정의하고 `register()` 안에서만
+`guard(...)`로 감싼다 — `def` 위에 `@guard(...)`를 바로 붙이지 않는다. import
+시점엔 `guard`가 존재하지 않기 때문이다(`tools.guard.make_tool_guard(settings)`
+의 반환값, 서버 인스턴스별로 만들어짐 — 이유는 `tools/guard.py`/
+`tools/registry.py` 참고).
 
-Why the JSON Schema `guard`-wrapping risk turned out to be a non-issue
------------------------------------------------------------------------
-`tools/guard.py`'s wrapper already applies `functools.wraps(fn)`, which copies
-`__wrapped__ = fn` onto the wrapper. Both places the SDK derives a tool's shape from
-follow that chain automatically:
+**JSON Schema가 wrapper에 오염되지 않는 이유**: `guard`가 `functools.wraps(fn)`
+으로 `__wrapped__ = fn`을 복사하므로, SDK가 tool 형태를 유도하는 두 지점
+(`func_metadata`의 `inspect.signature(..., eval_str=True)`,
+`find_context_parameter`의 `typing.get_type_hints`) 모두 이 체인을 따라가
+wrapper의 `*args, **kwargs`가 아닌 원본 `fn`의 실제 시그니처를 본다. 그래서
+`ctx: Context`도 정상적으로 스키마에서 제외된다(`skip_names`). 실측: 이
+태스크 테스트 파일의 `tools/list` 단언이 4개 tool 모두
+`input_schema.properties`에 실제 도메인 파라미터(`repo`/`path`/`ref`/`query`)만
+있고 `ctx`/`args`/`kwargs`는 없음을 확인한다 — `tools/guard.py`는 이 태스크를
+위해 손댈 필요가 없었다.
 
-- `mcp.server.mcpserver.utilities.func_metadata.func_metadata` builds the input-schema
-  Pydantic model from `inspect.signature(func, eval_str=True)`, and `inspect.signature`
-  defaults `follow_wrapped=True` — it silently unwraps to the *original* `fn`'s real
-  signature (parameter names, types, defaults), not the wrapper's `*args, **kwargs`.
-- `mcp.server.mcpserver.utilities.context_injection.find_context_parameter` calls
-  `typing.get_type_hints(wrapper)`; `get_type_hints` walks the same `__wrapped__` chain
-  to resolve forward-reference globals against `fn`'s own module, while still reading
-  `hints = wrapper.__annotations__` — the very dict `functools.wraps` copied from `fn` —
-  so the `ctx: Context` parameter is found and excluded from the schema (`skip_names`)
-  exactly as if `find_context_parameter` had been run on `fn` directly.
+**TASK-023(`GitHubToolContext`)과의 lifespan 계약**: tool은 TASK-023의
+lifespan이 실행되기 훨씬 전, `create_server` 시점에 *등록*되므로(`tools/
+registry.py`의 "Dependency timing" 참고) 모든 tool 본문은 클로저가 아니라
+호출 시점마다 `ctx.request_context.lifespan_context`를 통해 `GitHubClient`를
+꺼낸다. `GitHubToolContext`는 이 계약의 이 모듈 쪽 Protocol — 런타임 보장은
+아니므로(`@runtime_checkable` 아님, attribute 존재만 확인) `_require_lifespan`
+이 사용 전 매번 `isinstance`로 재검증해 lifespan 누락/오형식(SDK 기본
+lifespan은 빈 `{}` — 설치된 `mcp==2.1.1`에서 실측)을 조용한 `AttributeError`
+대신 명확한 `ToolError`로 바꾼다.
 
-Verified empirically, not just by source reading — see this task's test file for a
-`tools/list` assertion that every one of the 4 tools' `input_schema.properties` names
-its real domain parameters (`repo`/`path`/`ref`/`query`) and never `ctx`, `args`, or
-`kwargs`. Net effect: `tools/guard.py` needed no change for this task.
+**`repo_allowlist`가 `github`와 같은 Protocol에 얹힌 이유**: `list_repos`
+(`AC-005-1`)는 `guard(...)`의 `repo_arg`가 검사할 `repo` 인자가 없는 유일한
+tool이라 allowlist 필터링이 자신의 몫인데, `register(mcp, guard)`(`Registrar`
+시그니처 `(mcp, guard) -> None`)엔 `Settings`를 넘길 방법이 없다. 모든 tool
+호출에 닿으면서 `Settings`에도 접근 가능한 유일한 값이 lifespan context라,
+`repo_allowlist: frozenset[str]`를 별도 주입 경로 대신 `github` 옆에 함께
+실었다.
 
-Lifespan contract with TASK-023 (`GitHubToolContext`)
--------------------------------------------------------
-A tool is *registered* at `create_server` time, well before TASK-023's lifespan ever
-runs (`tools/registry.py`'s "Dependency timing" section) — so every tool body reaches
-for its `GitHubClient` through `ctx.request_context.lifespan_context` at *call* time,
-per-request, rather than closing over one built at import/registration time.
+**`list_repos`가 allowlist 항목별 조회 대신 installation 목록을 통째로
+필터링하는 이유**: `GitHubClient`엔 "저장소 1개 조회" 메서드가 없고(새 메서드
+추가는 범위 밖 — `client.py`는 "하지 말 것" 목록), `AC-005-1`이 필요한 필드는
+`list_installation_repositories()`뿐이다. 그래서 installation의 전체
+목록을 가져와 `repo_allowlist`에도 있는 항목만 남긴다
+(`auth.policy.is_repo_allowlisted`) — AC-005-1의 "installation이 못 보는
+allowlist 항목은 결과에 없어야 한다"를 그대로 만족한다.
 
-`GitHubToolContext` (below) is this module's half of that contract: the Protocol shape
-TASK-023's lifespan value must satisfy. This module never trusts the Protocol as a
-*runtime* guarantee, though — a `Protocol` is a static-only check unless decorated
-`@runtime_checkable`, and even then only verifies attribute presence, never that
-`github` actually holds a `GitHubClient`. Until TASK-023 wires a real lifespan into
-`MCPServer(...)`, the SDK's own default lifespan (`mcp.server.lowlevel.server.lifespan`,
-verified in the installed `mcp==2.1.1`) yields a bare `{}` — so `_require_lifespan`
-below always re-validates both attributes with `isinstance` before use, turning a
-missing/wrong-shaped lifespan context into a clear `ToolError` (never a silent
-`AttributeError` from attribute access on a plain `dict`).
-
-`repo_allowlist` rides along in the same Protocol, not just `github`
------------------------------------------------------------------------
-`list_repos` (`AC-005-1`) is the one tool with no `repo` argument for `guard(...)`'s
-`repo_arg` mechanism to check — filtering against the allowlist is explicitly this
-tool's own job (handover note, `tools/guard.py`'s docstring). But nothing hands a
-`Settings` (or its `repo_allowlist`) to `register(mcp, guard)` — the `Registrar`
-signature is `(mcp, guard) -> None` only (`tools/registry.py`). The lifespan context
-is the only value TASK-023 constructs *with* access to `Settings` that also reaches
-every tool call, so `repo_allowlist: frozenset[str]` is carried on `GitHubToolContext`
-alongside `github` rather than invented as a second injection path.
-
-`list_repos`: installation-list-then-filter, not per-allowlist-entry lookups
------------------------------------------------------------------------------
-`GitHubClient` has no "fetch one repository's details" method — only
-`list_installation_repositories()` returns the `RepositorySummary` fields `AC-005-1`
-needs (`name`/`description`/`default_branch`), and adding a new client method is out of
-this task's scope (`client.py` is on the "하지 말 것" list). So the only feasible
-(and correct) strategy is: fetch the installation's full, already-paginated repository
-list once, then keep only the entries also present in `repo_allowlist`
-(`auth.policy.is_repo_allowlisted`). This also directly satisfies AC-005-1's "installation
-이 못 보는 allowlist 항목은 결과에 없어야 한다" — an allowlist entry the installation
-never returned is never synthesized into the result, since the loop only ever narrows
-what GitHub actually reported.
-
-`search_code`'s rate-limit note lives in its own docstring (RES-API-004: GitHub's code
-search endpoint allows only 10 authenticated requests/minute — its own, much tighter
-bucket than other search endpoints' 30/minute), not just in this module docstring,
-because the tool docstring is what actually reaches the calling model.
+`search_code`의 rate-limit 안내(분당 10건, 다른 검색 엔드포인트의 30건보다
+좁음 — RES-API-004)는 이 모듈 docstring뿐 아니라 자신의 docstring에도 있다.
+tool docstring은 호출 모델에 실제로 전달되는 텍스트이기 때문이다.
 """
 
 from __future__ import annotations
@@ -108,48 +78,45 @@ from devoks_mcp_management.types import (
 if TYPE_CHECKING:
     from mcp.server.mcpserver import MCPServer
 
-    # Deferred to type-checking only: `registry.py` imports this module's
-    # `register` at its own module scope (`tools/registry.py`'s "how TASK-022
-    # appends" section), so a *runtime* import here of anything from
-    # `registry.py` would be circular. `Guard` is only ever used in a type
-    # position below, and `from __future__ import annotations` (this file's
-    # first import) keeps every annotation an unevaluated string at runtime,
-    # so this forward reference never needs to actually resolve outside a
-    # type checker.
+    # 타입체크 시점에만 import: `registry.py`가 자신의 모듈 스코프에서 이
+    # 모듈의 `register`를 import하므로(`tools/registry.py`의 "how TASK-022
+    # appends" 절) 여기서 `registry.py`의 뭔가를 *런타임*에 import하면 순환
+    # import가 된다. `Guard`는 아래에서 타입 위치로만 쓰이고, 이 파일 첫
+    # import인 `from __future__ import annotations`가 모든 annotation을
+    # 런타임엔 평가 안 되는 문자열로 유지하므로, 이 forward reference는
+    # 타입체커 밖에서 실제로 resolve될 필요가 없다.
     from devoks_mcp_management.tools.registry import Guard
 
 __all__ = ["GitHubToolContext", "register"]
 
 
 class GitHubToolContext(Protocol):
-    """Expected shape of the MCP *protocol* lifespan context these tools need.
+    """이 tool들이 필요로 하는 MCP *프로토콜* lifespan context의 형태.
 
-    TASK-023 constructs the real value inside its `lifespan()` and yields it as the
-    argument `MCPServer(..., lifespan=...)` receives — see the module docstring's
-    "Lifespan contract with TASK-023" section for why this is a `Protocol` rather
-    than a concrete dataclass this module owns, and for why every attribute read
-    through it is still re-validated with `isinstance` at call time.
+    TASK-023이 자신의 `lifespan()` 안에서 실값을 만들어 `MCPServer(...,
+    lifespan=...)`의 인자로 넘긴다 — 왜 구체 dataclass가 아니라 Protocol인지,
+    그리고 왜 여기로 읽는 attribute를 호출 시점에 `isinstance`로 재검증하는지는
+    모듈 docstring의 "TASK-023과의 lifespan 계약" 절 참고.
 
-    Attribute names below are exact and load-bearing: TASK-023 must populate an
-    object exposing precisely `github` and `repo_allowlist`.
+    아래 attribute 이름은 정확히 지켜야 한다 — TASK-023은 `github`와
+    `repo_allowlist`를 정확히 노출하는 객체를 채워야 한다.
     """
 
     github: GitHubClient
-    """The `GitHubClient` TASK-023 builds once at startup (`DSN-004`)."""
+    """TASK-023이 기동 시 1회 만드는 `GitHubClient`(`DSN-004`)."""
 
     repo_allowlist: frozenset[str]
-    """`CTR-008`'s configured allowlist — `Settings.repo_allowlist` verbatim.
-    Only `list_repos` reads this; see the module docstring for why."""
+    """`CTR-008` 설정 allowlist — `Settings.repo_allowlist` 그대로.
+    `list_repos`만 읽는다(이유는 모듈 docstring 참고)."""
 
 
 def _require_lifespan(ctx: Context) -> tuple[GitHubClient, frozenset[str]]:
-    """Fetch and validate `ctx`'s lifespan context against `GitHubToolContext`.
+    """`ctx`의 lifespan context를 가져와 `GitHubToolContext`와 대조 검증한다.
 
-    Raises `ToolError` — never a bare `AttributeError` — when the lifespan context is
-    absent (the SDK's own default lifespan yields `{}` until TASK-023 wires the real
-    one) or does not match the expected shape. See `GitHubToolContext`'s docstring for
-    why this re-checks with `isinstance` rather than trusting the static Protocol
-    annotation alone.
+    lifespan context가 없거나(TASK-023이 실제 lifespan을 연결하기 전엔 SDK
+    기본 lifespan이 `{}`를 냄) 기대 형태와 다르면 평범한 `AttributeError`가
+    아니라 `ToolError`를 던진다. `isinstance`로 재검증하는 이유는
+    `GitHubToolContext`의 docstring 참고.
     """
     lifespan_context = ctx.request_context.lifespan_context
     github = getattr(lifespan_context, "github", None)
@@ -160,17 +127,16 @@ def _require_lifespan(ctx: Context) -> tuple[GitHubClient, frozenset[str]]:
             "GitHub client yet. This is a server configuration issue, not a caller "
             "error — contact the server operator."
         )
-    # `isinstance(x, frozenset)` only narrows the container, not its element type
-    # (pyright: reportUnknownVariableType) -- `repo_allowlist` is this server's own
-    # `Settings.repo_allowlist` (already `frozenset[str]`-validated by `config.py`),
-    # never external/untrusted input, so a shallow container check is sufficient and
-    # this cast is safe.
+    # `isinstance(x, frozenset)`는 컨테이너만 좁히고 원소 타입은 못 좁힌다
+    # (pyright: reportUnknownVariableType) -- `repo_allowlist`는 이 서버 자신의
+    # `Settings.repo_allowlist`(이미 `config.py`가 `frozenset[str]`로 검증)이지
+    # 외부/미신뢰 입력이 아니므로 얕은 컨테이너 검사로 충분하고 이 cast는 안전.
     return github, cast(frozenset[str], repo_allowlist)
 
 
-# --- Structured response payloads (SDK auto-detects a `TypedDict` return as this
-# tool's `output_schema` / `structured_content` — see `func_metadata`'s docstring
-# in the installed `mcp==2.1.1`) --------------------------------------------------
+# --- 구조화 응답 payload (SDK가 `TypedDict` 반환을 자동으로 이 tool의
+# `output_schema`/`structured_content`로 인식 — 설치된 `mcp==2.1.1`의
+# `func_metadata` docstring 참고) -------------------------------------------------
 
 
 class RepoSummaryPayload(TypedDict):
@@ -200,10 +166,10 @@ class GetRepoTreeResult(TypedDict):
     count: int
 
 
-#: Mirrors `client.ContentStatus` (not imported directly: that alias is not in
-#: `client.py`'s `__all__`, so this module treats it as private to that module and
-#: keeps its own copy — the 4 values are closed-by-design, see that module's
-#: `FileContent` docstring, "Why no fifth status value was added").
+#: `client.ContentStatus`를 그대로 미러링(직접 import는 안 함: 그 alias는
+#: `client.py`의 `__all__`에 없어 이 모듈은 그걸 private로 취급하고 자체
+#: 사본을 둔다 — 4개 값은 설계상 닫혀 있음, 그 모듈의 `FileContent` docstring
+#: "다섯 번째 status 값을 만들지 않은 이유" 참고).
 ReadFileStatus = Literal["complete", "truncated", "binary", "unavailable"]
 
 
@@ -213,9 +179,9 @@ class ReadFileResult(TypedDict):
     ref: str | None
     status: ReadFileStatus
     content: str | None
-    """The file's content, or a byte-prefix of it — **check `status` before trusting
-    this as the whole file**; see `read_file`'s own docstring, which is what reaches
-    the calling model."""
+    """파일 내용, 또는 그 byte-prefix — **전체 파일로 신뢰하기 전에 `status`를
+    먼저 확인**할 것. 호출 모델에 실제로 전달되는 `read_file` 자신의 docstring
+    참고."""
     returned_size: int
     total_size: int
     message: str | None
@@ -235,9 +201,9 @@ class SearchCodeResult(TypedDict):
     total_count: int
     incomplete_results: bool
     message: str | None
-    """Set only when `returned_count < total_count`, explaining the cap and steering
-    the model away from repeating the (rate-limited) search — see `search_code`'s
-    own docstring."""
+    """`returned_count < total_count`일 때만 설정 — cap을 설명하고 (rate-limit
+    걸린) 검색 재시도를 모델이 피하도록 유도. `search_code` 자신의 docstring
+    참고."""
 
 
 def _repo_payload(repo: RepositorySummary) -> RepoSummaryPayload:
@@ -257,34 +223,32 @@ def _search_item_payload(item: SearchResultItem) -> SearchResultItemPayload:
     return {"repository": item.repository, "path": item.path, "excerpt": item.excerpt}
 
 
-# --- Tool bodies (undecorated — see module docstring for why) -------------------
+# --- Tool 본문(데코레이터 없음 — 이유는 모듈 docstring 참고) -------------------
 
 
 async def list_repos(ctx: Context) -> ListReposResult:
-    """List the GitHub repositories this server is allowed to access.
+    """이 서버가 접근 가능한 GitHub 저장소 목록을 반환한다.
 
-    Returns only repositories that are BOTH visible to this server's GitHub App
-    installation AND present in the server's configured repository allowlist — the
-    intersection of the two, never the full installation list and never an
-    allowlisted name the installation cannot actually see. Call this first to find
-    out which `repo` values ("owner/repo") you may pass to `get_repo_tree`,
-    `read_file`, or `search_code`.
+    이 서버의 GitHub App installation에 보이는 저장소 AND 서버에 설정된
+    repository allowlist에 있는 저장소 — 둘의 교집합만 반환한다. installation
+    전체 목록도, installation이 실제로 볼 수 없는 allowlist 이름도 아니다.
+    `get_repo_tree`/`read_file`/`search_code`에 넘길 수 있는 `repo`
+    값("owner/repo")을 알아내려면 이 tool을 먼저 호출할 것.
     """
     github, repo_allowlist = _require_lifespan(ctx)
     if not repo_allowlist:
-        # TASK-044 / EDGE-001: an empty allowlist denies every repository by
-        # construction (`is_repo_allowlisted` can never match), so the
-        # intersection below is empty regardless of what the installation can
-        # see. Returning here skips a GitHub round trip whose entire result
-        # would be filtered away — which matters beyond tidiness: that call
-        # spends a rate-limit unit (EDGE-003) and, on a fresh deployment where
-        # `MCP_REPO_ALLOWLIST` has not been set yet (its default *is* empty —
-        # CTR-008), it would be spent on every `list_repos` call.
+        # TASK-044 / EDGE-001: 빈 allowlist는 설계상 모든 저장소를 거부하므로
+        # (`is_repo_allowlisted`가 절대 매치 안 됨) 아래 교집합은 installation이
+        # 뭘 보든 항상 비어 있다. 여기서 바로 반환해 어차피 전부 필터링될
+        # GitHub 왕복을 건너뛴다 — 단순 정리 이상의 의미가 있다: 그 호출은
+        # rate-limit 단위를 쓰고(EDGE-003), `MCP_REPO_ALLOWLIST`를 아직 설정
+        # 안 한 신규 배포(기본값이 빈 값 — CTR-008)에선 `list_repos`를 부를
+        # 때마다 낭비된다.
         #
-        # The response shape is identical to the filtered-to-nothing case, so
-        # a client cannot distinguish "allowlist is empty" from "installation
-        # sees nothing allowlisted" — same direction as AC-003-5's refusal to
-        # leak allowlist contents.
+        # 응답 형태가 "필터링해서 없음" 케이스와 동일해, 클라이언트는
+        # "allowlist가 비었음"과 "installation이 allowlist 항목을 하나도 못
+        # 봄"을 구분할 수 없다 — allowlist 내용을 새지 않는다는 AC-003-5와
+        # 같은 방향.
         return {"repos": [], "count": 0}
     installation_repos = await github.list_installation_repositories()
     allowed = [
@@ -296,14 +260,14 @@ async def list_repos(ctx: Context) -> ListReposResult:
 async def get_repo_tree(
     repo: str, ctx: Context, path: str = "", ref: str | None = None
 ) -> GetRepoTreeResult:
-    """List the files and directories at a path inside a repository.
+    """저장소 안 한 경로의 파일·디렉터리 목록을 반환한다.
 
-    `repo` must be `"owner/repo"` and must be one of the repositories `list_repos`
-    returned. `path` defaults to the repository root (`""`) so you can start
-    exploring from the top; pass a subdirectory path to descend further. `ref` is a
-    branch, tag, or commit SHA — omit it to use the repository's default branch.
-    Each entry reports its `name`, `path`, `type` (`"file"` or `"dir"`), and `size`
-    in bytes; use this to navigate before calling `read_file` on a specific file.
+    `repo`는 `"owner/repo"` 형태여야 하며 `list_repos`가 반환한 저장소 중
+    하나여야 한다. `path`는 기본값이 저장소 루트(`""`)라 처음부터 탐색을
+    시작할 수 있고, 하위 디렉터리로 내려가려면 그 경로를 넘긴다. `ref`는
+    branch/tag/commit SHA — 생략하면 저장소 기본 branch를 쓴다. 각 항목은
+    `name`/`path`/`type`(`"file"` 또는 `"dir"`)/`size`(byte)를 보고한다 —
+    특정 파일에 `read_file`을 부르기 전에 이걸로 먼저 탐색할 것.
     """
     github, _ = _require_lifespan(ctx)
     entries = await github.get_repo_tree(repo, path, ref)
@@ -317,22 +281,21 @@ async def get_repo_tree(
 
 
 async def read_file(repo: str, path: str, ctx: Context, ref: str | None = None) -> ReadFileResult:
-    """Read the text content of one file in a repository.
+    """저장소 안 파일 하나의 텍스트 내용을 읽는다.
 
-    `repo` must be `"owner/repo"` and must be one of the repositories `list_repos`
-    returned; `path` is the file's path as reported by `get_repo_tree`. `ref` is a
-    branch, tag, or commit SHA — omit it to use the repository's default branch.
+    `repo`는 `"owner/repo"` 형태이고 `list_repos`가 반환한 저장소 중
+    하나여야 한다. `path`는 `get_repo_tree`가 보고한 파일 경로. `ref`는
+    branch/tag/commit SHA — 생략하면 기본 branch를 쓴다.
 
-    Always check `status` before trusting `content`:
-    - `"complete"`: `content` is the entire file.
-    - `"truncated"`: `content` is only a PREFIX of the file — `message` states how
-      many of the file's `total_size` bytes were actually returned. Do not treat
-      this as the whole file, and do not draw conclusions about code past the cut
-      point.
-    - `"binary"`: the file is not valid UTF-8 text; `content` is `None`.
-      `total_size` still reports the file's size.
-    - `"unavailable"`: the file is too large for this server to read at all (over
-      GitHub's 100 MB content-API limit); `content` is `None`.
+    `content`를 신뢰하기 전 항상 `status`를 먼저 확인할 것:
+    - `"complete"`: `content`가 파일 전체.
+    - `"truncated"`: `content`는 파일의 PREFIX일 뿐 — `total_size` 중 실제로
+      몇 byte가 반환됐는지는 `message`에 있다. 전체 파일로 취급하거나 절단
+      지점 이후 코드에 대해 결론 내리지 말 것.
+    - `"binary"`: 유효한 UTF-8 텍스트가 아님 — `content`는 `None`이고
+      `total_size`는 그대로 파일 크기를 보고.
+    - `"unavailable"`: 이 서버가 아예 읽을 수 없을 만큼 큼(GitHub 100MB
+      content API 한도 초과) — `content`는 `None`.
     """
     github, _ = _require_lifespan(ctx)
     result: FileContent = await github.read_file(repo, path, ref)
@@ -349,18 +312,17 @@ async def read_file(repo: str, path: str, ctx: Context, ref: str | None = None) 
 
 
 async def search_code(query: str, repo: str, ctx: Context) -> SearchCodeResult:
-    """Search for code matching a query inside one repository.
+    """저장소 하나 안에서 쿼리와 매치하는 코드를 검색한다.
 
-    `repo` must be `"owner/repo"` and must be one of the repositories `list_repos`
-    returned. Returns matching file paths with a short excerpt of each match.
+    `repo`는 `"owner/repo"` 형태이고 `list_repos`가 반환한 저장소 중
+    하나여야 한다. 매치한 파일 경로와 각 매치의 짧은 발췌를 반환한다.
 
-    IMPORTANT rate limit: GitHub's code search endpoint allows only 10 requests per
-    minute, even when authenticated — its own, much tighter bucket than other
-    GitHub search endpoints (30/minute). Do not call this tool repeatedly to explore
-    a repository; after an initial search, prefer `get_repo_tree` and `read_file` to
-    narrow in on specific files instead of re-running searches. Results are capped
-    at a server-configured maximum — `returned_count`/`total_count` in the response
-    tell you whether more matches exist beyond what was returned.
+    중요 rate limit: GitHub 코드 검색 엔드포인트는 인증돼 있어도 분당 10
+    요청뿐 — 다른 GitHub 검색 엔드포인트(분당 30)보다 훨씬 좁은 자신만의
+    버킷이다. 저장소 탐색을 위해 이 tool을 반복 호출하지 말 것 — 첫 검색
+    이후엔 재검색 대신 `get_repo_tree`/`read_file`로 특정 파일을 좁혀갈 것.
+    결과는 서버 설정 최대치로 제한되며, 응답의 `returned_count`/
+    `total_count`로 반환된 것 너머에 더 있는지 알 수 있다.
     """
     github, _ = _require_lifespan(ctx)
     results: SearchResults = await github.search_code(query, repo)
@@ -385,15 +347,14 @@ async def search_code(query: str, repo: str, ctx: Context) -> SearchCodeResult:
 
 
 def register(mcp: MCPServer, guard: Guard) -> None:
-    """Register the core 4 GitHub tools (`DSN-005`) behind `guard`.
+    """core GitHub tool 4개(`DSN-005`)를 `guard`로 감싸 등록한다.
 
-    `guard(...)` is applied here, at registration time, not with a bare `@guard(...)`
-    atop each `def` above — see the module docstring for why. `name=` is passed
-    explicitly to `mcp.add_tool` (rather than relying on `fn.__name__`, which would
-    also happen to match) so the SDK-exposed tool name and `guard`'s own `tool`
-    argument (used for `CTR-007` RBAC and `CTR-003` audit records) can never drift
-    apart from `types.py`'s `TOOL_*` constants, even if a tool function is ever
-    renamed.
+    `guard(...)`는 여기, 등록 시점에 적용한다 — 위 각 `def` 위에 바로
+    `@guard(...)`를 붙이지 않는 이유는 모듈 docstring 참고. `name=`을
+    `mcp.add_tool`에 명시적으로 넘기는 이유(우연히 같은 값이 될 `fn.__name__`에
+    기대지 않고)는, SDK에 노출되는 tool 이름과 `guard`의 `tool` 인자(`CTR-007`
+    RBAC·`CTR-003` 감사 레코드에 쓰임)가 `types.py`의 `TOOL_*` 상수에서 절대
+    벗어나지 않게 하기 위함 — tool 함수 이름이 나중에 바뀌어도 안전하다.
     """
     mcp.add_tool(guard(TOOL_LIST_REPOS)(list_repos), name=TOOL_LIST_REPOS)
     mcp.add_tool(

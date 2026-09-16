@@ -1,81 +1,35 @@
-"""Static token table bearer verification (DSN-001, CTR-002, AC-002-1, AC-002-6).
+"""정적 토큰 테이블 기반 Bearer 인증 (DSN-001, CTR-002, AC-002-1, AC-002-6).
 
-``StaticTableTokenVerifier`` is the *only* place in this codebase that knows
-the Stage 1 verification mechanism is a static table sourced from
-``MCP_CLIENT_TOKENS``. Every other module — the tool guard (TASK-007), the
-server wiring (TASK-008) — consumes only the SDK's ``TokenVerifier`` protocol
-and ``AccessToken`` model. When Stage 2 replaces this with an IdP
-introspection call (FRD §10), the class satisfies the same protocol, so the
-change is confined to this file: a new class is written here (or this one is
-edited in place) and the constructor call at the composition root
-(``app.py``/``server.py``) is updated to use it — nothing that consumes
-``AccessToken`` changes. The class name says "static table" on purpose, so
-nobody mistakes it for the general-purpose verifier once a second
-implementation exists alongside it.
+``StaticTableTokenVerifier``만이 Stage 1의 인증 방식이 ``MCP_CLIENT_TOKENS``
+정적 테이블이라는 사실을 안다. 다른 모듈(guard, server 등)은 SDK의
+``TokenVerifier`` 프로토콜과 ``AccessToken``만 소비한다 — Stage 2에서 IdP
+introspection으로 교체될 때(FRD §10) 이 파일만 바뀌면 된다.
 
-Where ``role`` rides
+역할(role) 저장 위치
 ---------------------
-``CTR-002`` rows carry a ``role``, and ``auth.policy.authorize`` needs that
-role at authorization time. The SDK's ``AccessToken`` (verified empirically
-against the installed ``mcp==2.1.1`` package — see the module docstring
-below for the exact field set) has no ``role`` field of its own; it is an
-OAuth-shaped model (``token``, ``client_id``, ``scopes``, ``expires_at``,
-``resource``, ``subject``) plus one open extension point: ``claims: dict[str,
-Any] | None``, documented by the SDK as "additional claims (e.g. `iss`,
-`act`)".
+``AccessToken``(설치된 ``mcp==2.1.1`` 기준)에는 role 필드가 없고 확장 포인트
+``claims: dict[str, Any] | None``만 있다. 서브클래싱 대신
+``claims[_ROLE_CLAIM_KEY]``에 role을 담아 반환한다 — SDK 미들웨어
+(``BearerAuthBackend.authenticate`` / ``get_access_token()``)가
+``verify_token``이 반환한 객체를 그대로 왕복시키는지 실제 소스를 읽어
+확인했고, 서브클래스가 SDK 내부에서 조용히 base class로 좁혀질 위험을 없애기
+위함이다. ``get_role``이 이 키의 유일한 접근자다 — 호출부는
+``access_token.claims["role"]``을 직접 읽지 않는다.
 
-This module stores the resolved role at ``claims[_ROLE_CLAIM_KEY]`` on the
-``AccessToken`` it returns, rather than subclassing ``AccessToken``, because:
+타이밍 사이드채널
+------------------
+토큰 조회는 ``dict`` lookup이 아니라 테이블 전체를 순회하며 매 행마다
+``secrets.compare_digest``로 비교한다(매치해도 멈추지 않음) — dict lookup의
+O(1) 타이밍이 해시 버킷에 의존하는 특성을 배제하기 위해서다. 테이블 크기가
+작아(Stage 1, 내부 서비스 클라이언트 소수) O(n) 스캔 비용은 무시 가능하다.
 
-- the SDK middleware (``mcp.server.auth.middleware.bearer_auth
-  .BearerAuthBackend.authenticate``) does ``AuthenticatedUser(auth_info)``
-  with the exact object ``verify_token`` returned, and ``get_access_token()``
-  (``mcp.server.auth.middleware.auth_context``) later returns that same
-  ``auth_info`` unchanged — confirmed by reading both call sites in the
-  installed package, not assumed from the docs. A plain ``AccessToken`` with
-  populated ``claims`` round-trips through that path with zero risk of a
-  subclass being silently narrowed back to the base class somewhere in the
-  SDK's own (de)serialization.
-- ``claims`` is the field the SDK itself names for exactly this purpose, so
-  no extra type juggling is needed by callers that already type-check
-  against ``AccessToken``.
-
-``get_role`` below is the single accessor for that key — TASK-007's guard
-reads the role through this function, never through a raw
-``access_token.claims["role"]`` literal, so the storage key stays owned by
-this module (mirrors ``DSN-001``'s "one file" intent at the field level, not
-just the class level).
-
-Timing side channel (design note, see task context)
------------------------------------------------------
-Token lookup compares the presented token against every row of the table
-using ``secrets.compare_digest`` in a loop that runs to completion (never
-breaks early on a match), rather than a single ``dict[token]`` lookup. A
-dict lookup is O(1) but its timing depends on the token's hash bucket, not a
-property this module wants to reason about under a security review; a full
-scan with a constant-time compare per row removes that variable entirely.
-The token table for this deployment is a handful of internal service
-clients (Stage 1, FRD §6.4) — O(n) here is a handful of ``compare_digest``
-calls per request, not a scaling concern.
-
-Why the comparison is done on ``bytes`` (TASK-043)
-----------------------------------------------------
-``secrets.compare_digest`` accepts two ``str`` **only if both contain
-nothing but ASCII**; given a non-ASCII ``str`` it raises
-``TypeError: comparing strings with non-ASCII characters is not supported``
-(reproduced locally, not inferred). A ``str`` token arrives here straight
-from the ``Authorization`` header, so any client sending
-``Authorization: Bearer 토큰`` — a paste accident is enough — turned an
-ordinary "unregistered token" into an unhandled exception: HTTP **500 with a
-traceback** instead of the **401** ``AC-002-2`` requires, and an
-``error``-classified server log instead of a quiet auth failure.
-
-Both sides are therefore compared as UTF-8 ``bytes``. The table rows are
-encoded once in ``__init__`` rather than on every request, so the per-request
-cost is one ``str.encode`` for the presented token. ``compare_digest`` on
-``bytes`` has no ASCII restriction, which makes ``verify_token``'s "never
-raises" docstring true for *any* input rather than only for well-behaved
-input.
+bytes 비교 이유 (TASK-043)
+----------------------------
+``secrets.compare_digest``는 두 ``str``이 모두 ASCII일 때만 동작하고, 아니면
+``TypeError``를 던진다(로컬 재현 완료) — ``Authorization: Bearer 토큰``처럼
+비 ASCII 값이 오면 의도한 401(AC-002-2) 대신 500이 나갔다. 양쪽을 UTF-8
+``bytes``로 비교해 이 문제를 없앤다. 테이블 행은 요청마다가 아니라
+``__init__``에서 한 번만 인코딩한다.
 """
 
 import secrets
@@ -85,60 +39,55 @@ from mcp.server.auth.provider import AccessToken, TokenVerifier
 
 from devoks_mcp_management.config import ClientToken, Settings
 
-#: The key this module owns inside ``AccessToken.claims`` for the CTR-002
-#: role. Read only through ``get_role`` below — see module docstring.
+#: CTR-002 role를 담는 ``AccessToken.claims`` 키. ``get_role``을 통해서만
+#: 읽는다 — 모듈 docstring 참고.
 _ROLE_CLAIM_KEY = "role"
 
 
 class StaticTableTokenVerifier:
-    """`TokenVerifier` backed by the CTR-002 static token table (DSN-001).
+    """CTR-002 정적 토큰 테이블 기반 `TokenVerifier`(DSN-001).
 
-    Satisfies ``mcp.server.auth.provider.TokenVerifier`` structurally (that
-    Protocol is not ``@runtime_checkable`` — verified against the installed
-    SDK — so conformance is a static/pyright property here, not an
-    ``isinstance`` check; see ``tests/test_verifier.py``).
+    `mcp.server.auth.provider.TokenVerifier`를 구조적으로 만족한다 — 해당
+    Protocol은 `@runtime_checkable`이 아니므로(설치된 SDK 소스로 확인) 준수
+    여부는 `isinstance` 체크가 아니라 pyright 정적 검사로 보장된다
+    (`tests/test_verifier.py` 참고).
     """
 
     def __init__(self, client_tokens: Mapping[str, ClientToken]) -> None:
-        """Take the already-parsed-and-validated token table by injection.
+        """이미 파싱·검증된 토큰 테이블을 주입받는다.
 
-        ``config.load_settings`` has already enforced table shape and
-        role/tool consistency (AC-002-6 direction: tokens only ever come from
-        ``Settings``, never a literal in this module or a module-global read
-        of the environment).
+        `config.load_settings`가 테이블 형태와 role/tool 일관성을 이미
+        검증했다(AC-002-6 방향 — 토큰은 항상 `Settings`에서만 오고, 이 모듈의
+        리터럴이나 모듈 전역의 환경 읽기로는 오지 않는다).
         """
         self._client_tokens = client_tokens
-        # Encoded once here, not per request (TASK-043 — see module
-        # docstring). Snapshotting is safe: ``Settings`` is a frozen
-        # dataclass and its token table is never mutated after
-        # ``load_settings`` builds it.
+        # 요청마다가 아니라 여기서 한 번만 인코딩한다(TASK-043 — 모듈
+        # docstring 참고). 스냅샷이 안전한 이유: `Settings`는 frozen
+        # dataclass이고 `load_settings`가 만든 뒤 토큰 테이블은 변경되지 않는다.
         self._encoded_rows: tuple[tuple[bytes, ClientToken], ...] = tuple(
             (candidate.encode("utf-8"), entry) for candidate, entry in client_tokens.items()
         )
 
     @classmethod
     def from_settings(cls, settings: Settings) -> StaticTableTokenVerifier:
-        """Convenience constructor for the composition root (TASK-008)."""
+        """composition root(TASK-008)를 위한 편의 생성자."""
         return cls(settings.client_tokens)
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        """Look up ``token`` in the table; ``None`` for anything unregistered.
+        """`token`을 테이블에서 조회한다. 등록되지 않았으면 `None`.
 
-        Never raises and never logs the token itself (AC-004-3 direction) —
-        an unregistered token is an entirely ordinary outcome (a client
-        typo, a revoked credential), not an error condition worth
-        surfacing beyond the SDK's own 401 (AC-002-2, handled by the SDK,
-        not here).
+        예외를 던지지 않고 토큰 자체를 로그에도 남기지 않는다(AC-004-3 방향)
+        — 미등록 토큰은 SDK가 처리하는 401(AC-002-2) 이상으로 드러낼 에러가
+        아니라 흔한 결과(오타, 폐기된 자격증명)일 뿐이다.
 
-        "Never raises" holds for **any** ``str``, including non-ASCII: the
-        comparison runs on UTF-8 ``bytes`` precisely so that a token like
-        ``"토큰"`` is an ordinary 401 rather than a 500 (TASK-043 — see the
-        module docstring for the reproduction).
+        비 ASCII를 포함한 **모든** `str`에서 예외 없이 동작한다 — UTF-8
+        `bytes`로 비교하는 이유가 바로 이것(TASK-043, 재현은 모듈 docstring
+        참고).
         """
         presented = token.encode("utf-8")
         matched: ClientToken | None = None
-        # Constant-total-time scan (see module docstring): every row is
-        # compared, the loop never exits early on a hit.
+        # 상수 총 시간 스캔(모듈 docstring 참고) — 매치해도 루프를 일찍
+        # 끝내지 않는다.
         for candidate, entry in self._encoded_rows:
             if secrets.compare_digest(candidate, presented):
                 matched = entry
@@ -153,11 +102,11 @@ class StaticTableTokenVerifier:
 
 
 def get_role(access_token: AccessToken) -> str | None:
-    """Read back the CTR-002 role ``StaticTableTokenVerifier`` attached.
+    """`StaticTableTokenVerifier`가 붙인 CTR-002 role을 읽어온다.
 
-    Returns ``None`` if ``access_token.claims`` carries no role — e.g. an
-    ``AccessToken`` built by a different verifier — so a caller that forgets
-    to check gets a clean "no role" rather than a ``KeyError``/``TypeError``.
+    `access_token.claims`에 role이 없으면(예: 다른 verifier가 만든
+    `AccessToken`) `None` — 체크를 깜빡한 호출부도 `KeyError`/`TypeError`
+    대신 깔끔하게 "role 없음"을 받는다.
     """
     if access_token.claims is None:
         return None
@@ -165,10 +114,9 @@ def get_role(access_token: AccessToken) -> str | None:
     return role if isinstance(role, str) else None
 
 
-#: Static (pyright, strict mode) proof that ``StaticTableTokenVerifier``
-#: satisfies ``TokenVerifier`` structurally. ``TokenVerifier`` is not
-#: ``@runtime_checkable`` (verified against the installed ``mcp==2.1.1``: an
-#: ``isinstance`` check against it raises ``TypeError``), so this assignment
-#: — checked on every ``pyright`` run, not executed for any behavior of its
-#: own — is the conformance guarantee in place of an ``isinstance`` check.
+#: `StaticTableTokenVerifier`가 `TokenVerifier`를 구조적으로 만족한다는
+#: 정적(pyright strict) 증거. `TokenVerifier`는 `@runtime_checkable`이
+#: 아니라서(설치된 `mcp==2.1.1`로 확인 — `isinstance` 체크 시 `TypeError`)
+#: `isinstance` 대신 이 대입문을 매 `pyright` 실행마다 검사해 준수를
+#: 보장한다(런타임 동작은 없음).
 _conforms_to_token_verifier: TokenVerifier = StaticTableTokenVerifier({})

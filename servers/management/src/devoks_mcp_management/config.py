@@ -1,14 +1,12 @@
-"""Environment variables -> immutable ``Settings`` (DSN-006, Fail-Fast).
+"""환경변수 -> 불변 ``Settings`` (DSN-006, Fail-Fast).
 
-``load_settings`` is the sole entry point. It takes the environment mapping
-as an explicit argument rather than reading ``os.environ`` itself, so tests
-can inject a fake env without process-global side effects and so callers
-(``app.py`` / ``server.py``) control exactly when a startup failure happens.
+``load_settings``가 유일한 진입점이다. ``os.environ``을 직접 읽지 않고 환경변수 매핑을
+명시적 인자로 받아, 테스트가 프로세스 전역 상태를 건드리지 않고 가짜 env를 주입할 수
+있고 호출자(``app.py``/``server.py``)가 기동 실패 시점을 통제할 수 있다.
 
-All problems found in one call — missing keys, out-of-range numbers, bad
-JSON, an unparsable PEM — are collected and raised together in a single
-``ConfigError`` (FRD §5.2, AC-001-5, AC-006-4), so a misconfigured deployment
-is fixed in one edit-and-restart cycle instead of N.
+이번 호출에서 발견된 문제(누락 키, 범위 밖 숫자, 잘못된 JSON, 파싱 불가 PEM 등) 전부를
+모아 ``ConfigError`` 하나로 한 번에 던진다(FRD §5.2, AC-001-5, AC-006-4) — 배포자가
+수정-재기동을 N번이 아니라 1번만 거치게 하기 위함.
 """
 
 import json
@@ -33,12 +31,11 @@ from devoks_mcp_management.types import (
     TOKEN_REFRESH_LEEWAY_SECONDS_MIN,
 )
 
-#: Required keys (FRD §5.2 / CTR-006). ``MCP_ALLOWED_HOSTS`` is required (not
-#: merely recommended) because an empty allowlist does not fail loudly at
-#: request time — ``transport_security`` silently answers every request with
-#: 421, which looks like a generic transport error to callers (AC-001-5,
-#: EDGE-002). Catching that at startup instead of in production traffic is
-#: the whole point of Fail-Fast (DSN-006).
+#: 필수 키(FRD §5.2 / CTR-006). ``MCP_ALLOWED_HOSTS``가 권장이 아니라 필수인 이유 —
+#: 빈 allowlist는 요청 시점에 요란하게 실패하지 않는다. ``transport_security``가 모든
+#: 요청에 조용히 421만 반환해 호출자 눈엔 일반적인 전송 오류처럼 보인다(AC-001-5,
+#: EDGE-002). 이걸 프로덕션 트래픽이 아니라 기동 시점에 잡는 게 Fail-Fast(DSN-006)의
+#: 핵심이다.
 _REQUIRED_KEYS: tuple[str, ...] = (
     "MCP_ALLOWED_HOSTS",
     "MCP_PUBLIC_URL",
@@ -57,80 +54,70 @@ _MAX_PORT = 65535
 _DEFAULT_LOG_LEVEL = "INFO"
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
-#: CTR-008: 'owner/repo' exact match, no wildcards — restricted to GitHub's
-#: own owner/repo character set so a stray '*' or '?' is rejected rather than
-#: silently accepted as a literal (and never matched) allowlist entry.
+#: CTR-008: 'owner/repo' 정확히 일치, 와일드카드 없음 — GitHub 고유의 owner/repo
+#: 문자셋으로 제한해 실수로 들어간 '*'나 '?'가 (절대 매치되지 않는) 리터럴 allowlist
+#: 항목으로 조용히 수용되지 않고 즉시 거부되게 한다.
 _REPO_ALLOWLIST_ENTRY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
-#: FRD §5.1 gives CTR-004/005/009 as bounded numeric contracts but §5.2 does
-#: not assign them env var names — Stage 1 has no override surface documented
-#: for them. These names follow the project's ``MCP_``-prefixed convention so
-#: an operator can override the default without a code change; see the
-#: handover note on TASK-003 for this gap-fill decision.
+#: FRD §5.1은 CTR-004/005/009를 범위 있는 숫자 계약으로 주지만 §5.2는 이들에 env var
+#: 이름을 부여하지 않는다 — Stage 1엔 오버라이드 경로가 문서화돼 있지 않다. 아래 이름들은
+#: 프로젝트의 ``MCP_`` 접두 컨벤션을 따라 운영자가 코드 변경 없이 기본값을 오버라이드할
+#: 수 있게 한 것 — 이 gap-fill 결정은 TASK-003 handover 노트 참고.
 _ENV_READ_FILE_MAX_BYTES = "MCP_READ_FILE_MAX_BYTES"
 _ENV_SEARCH_CODE_MAX_RESULTS = "MCP_SEARCH_CODE_MAX_RESULTS"
 _ENV_TOKEN_REFRESH_LEEWAY_SECONDS = "MCP_TOKEN_REFRESH_LEEWAY_SECONDS"
-#: Minimum length for a `MCP_CLIENT_TOKENS` key (TASK-046).
+#: `MCP_CLIENT_TOKENS` 키의 최소 길이(TASK-046).
 #:
-#: WHY THIS VALIDATION EXISTS — a real incident, not a hypothetical:
-#: the deployed Lambda was found running with the bearer token
-#: `dev-local-token-change-me`, which is the literal placeholder published in
-#: this repository's own tracked `.env.example`. The repository is public and
-#: the Function URL had been written into a commit message, so the service
-#: was effectively open to the internet. Access logs showed no third-party
-#: IP, so nothing was exfiltrated, but the exposure was real.
+#: 이 검증이 존재하는 이유 — 가정이 아니라 실제 사고: 배포된 Lambda가 이 저장소
+#: 자신의 추적 대상 `.env.example`에 실린 그 placeholder 문자열
+#: `dev-local-token-change-me`를 bearer 토큰으로 그대로 쓰고 있는 채 운영 중이었다.
+#: 저장소는 public이고 Function URL도 커밋 메시지에 노출돼 있어 서비스가 사실상
+#: 인터넷에 열려 있던 상태. 접근 로그에 제3자 IP는 없어 실제 유출은 없었지만
+#: 노출 자체는 실재했다.
 #:
-#: The root cause is structural, and it is worth naming precisely: the
-#: `GITHUB_APP_PRIVATE_KEY` placeholder in `.env.example` is **invalid on
-#: purpose** — `_parse_private_key` rejects it, so a deployment that forgot
-#: to replace it fails to start. The token placeholder had no such property:
-#: it was a perfectly valid token table, so copying `.env.example` forward
-#: produced a *working* server with a *published* credential and no signal
-#: at all.
+#: 근본 원인은 구조적이다: `.env.example`의 `GITHUB_APP_PRIVATE_KEY` placeholder는
+#: **의도적으로 무효**해서(`_parse_private_key`가 거부) 교체를 잊으면 기동 자체가
+#: 실패한다. 반면 토큰 placeholder는 그런 장치가 없었다 — 완벽하게 유효한 토큰
+#: 테이블이었으므로 `.env.example`을 그대로 복사해도 *동작하는* 서버가 *공개된*
+#: 자격증명을 들고 아무 신호 없이 떠 있었다.
 #:
-#: 32 characters is the floor rather than a specific format because CTR-002
-#: does not constrain token shape. `secrets.token_urlsafe(32)` yields 43
-#: characters / 256 bits, comfortably above it; anything a human types by
-#: hand falls below it. Paired with a `.env.example` placeholder that is now
-#: deliberately **too short to pass**, the placeholder can no longer reach
-#: production silently.
+#: CTR-002가 토큰 형식을 규정하지 않으므로 32자는 특정 포맷이 아니라 하한선이다.
+#: `secrets.token_urlsafe(32)`는 43자/256비트로 여유 있게 상회하고, 사람이 손으로
+#: 타이핑한 값은 대부분 미달한다. `.env.example` placeholder도 이제 **의도적으로
+#: 이 기준을 통과 못 하는 길이**로 바꿔뒀으므로, placeholder가 조용히 프로덕션까지
+#: 흘러갈 수 없다.
 _MIN_CLIENT_TOKEN_LENGTH = 32
 
 _ENV_STATELESS_HTTP = "MCP_STATELESS_HTTP"
 _ENV_JSON_RESPONSE = "MCP_JSON_RESPONSE"
 
-# CTR-011: both default to True because the deployment target is Lambda +
-# Function URL (FRD §10 Stage 2). A Lambda execution environment is frozen
-# between invocations and replaced without warning, so a server that issues
-# `Mcp-Session-Id` would hand clients a session no later invocation can be
-# guaranteed to still hold; and an SSE stream that outlives the response is
-# incompatible with the freeze. Flip both to `false` to run this same image
-# behind a sticky-session load balancer instead (FRD §7's option (a)).
+# CTR-011: 둘 다 기본값 True인 이유는 배포 대상이 Lambda + Function URL이기 때문
+# (FRD §10 Stage 2). Lambda 실행 환경은 호출 사이에 얼어붙고 예고 없이 교체되므로,
+# `Mcp-Session-Id`를 발급하는 서버는 이후 호출이 그 세션을 계속 들고 있음을 보장 못 할
+# 클라이언트에게 세션을 쥐여주는 셈이고, 응답보다 오래 사는 SSE 스트림도 이 freeze와
+# 상충한다. 같은 이미지를 sticky-session 로드밸런서 뒤에서 돌리려면(FRD §7 옵션 (a))
+# 둘 다 `false`로 뒤집는다.
 _DEFAULT_STATELESS_HTTP = True
 _DEFAULT_JSON_RESPONSE = True
 
-# Accepted spellings for the two boolean keys. Deliberately a closed set
-# rather than Python's `bool(str)` (which makes "false" truthy) or
-# `distutils.util.strtobool` (removed in 3.12): a typo'd value must be a
-# start-up failure per DSN-006, not a silently-wrong protocol mode.
+# 두 boolean 키가 허용하는 표기. Python의 `bool(str)`("false"도 truthy로 만듦)나
+# `distutils.util.strtobool`(3.12에서 제거됨) 대신 의도적으로 닫힌 집합을 쓴다 —
+# 오타 값은 DSN-006에 따라 기동 실패여야지 조용히 잘못된 프로토콜 모드가 되면 안 된다.
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
 
 class ConfigError(Exception):
-    """One or more environment values failed validation at startup.
-
-    The message lists every problem found in this call, not just the first.
-    """
+    """시작 시 환경변수 검증 실패 — 메시지에 이번 호출에서 발견된 문제를 전부 모아 담는다."""
 
 
 class _FieldError(Exception):
-    """Internal control flow only: carries one field's user-facing message."""
+    """내부 제어 흐름 전용 — 필드 하나의 사용자용 에러 메시지를 담아 전달한다."""
 
 
 @dataclass(frozen=True, slots=True)
 class ClientToken:
-    """One row of the CTR-002 token table, keyed by the bearer token itself."""
+    """CTR-002 토큰 테이블의 행 하나 — bearer 토큰 자체를 키로 삼는다."""
 
     client_id: str
     role: str
@@ -139,12 +126,12 @@ class ClientToken:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    """Immutable, fully-validated server configuration.
+    """불변이고 완전히 검증된 서버 설정.
 
-    Construct only via ``load_settings`` — every field has already passed
-    range/schema/PEM validation by the time this object exists. The token
-    table and the GitHub App private key are excluded from ``repr`` so that
-    logging or raising a ``Settings`` instance can never leak a secret.
+    반드시 ``load_settings``로만 생성 — 이 객체가 존재하는 시점엔 모든 필드가 이미
+    범위/스키마/PEM 검증을 통과한 상태다. 토큰 테이블과 GitHub App private key는
+    ``repr``에서 제외해, ``Settings`` 인스턴스를 로그로 찍거나 예외로 raise해도
+    비밀이 새지 않게 한다.
     """
 
     allowed_hosts: tuple[str, ...]
@@ -166,11 +153,10 @@ class Settings:
 
 
 def load_settings(env: Mapping[str, str]) -> Settings:
-    """Parse and validate ``env`` into a ``Settings``.
+    """``env``를 파싱/검증해 ``Settings``로 변환.
 
-    Raises ``ConfigError`` if any required key is missing or any value fails
-    format/range/schema validation. All problems are collected before
-    raising.
+    필수 키 누락, 형식/범위/스키마 오류 시 ``ConfigError`` — 모든 문제를 모아 한 번에
+    던진다.
     """
     errors: list[str] = []
 
@@ -229,9 +215,9 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         except _FieldError as exc:
             errors.append(str(exc))
 
-    # MCP_REPO_ALLOWLIST: absent/empty is the fail-safe default (EDGE-001) —
-    # an empty allowlist denies every repo, so it is never a missing-key
-    # failure. This is the opposite direction from every other key above.
+    # MCP_REPO_ALLOWLIST: 없거나 비어 있는 게 fail-safe 기본값(EDGE-001) — 빈
+    # allowlist는 모든 repo를 거부하므로 missing-key 실패로 취급하지 않는다. 위의
+    # 다른 모든 키와 반대 방향.
     repo_allowlist: frozenset[str]
     try:
         repo_allowlist = _parse_repo_allowlist(env.get("MCP_REPO_ALLOWLIST", ""))
@@ -343,16 +329,14 @@ def _parse_url(raw: str, key: str) -> str:
     return value
 
 
-#: TASK-009 empirical finding (FRD §5.2): the SDK derives CTR-001's
-#: well-known discovery route from MCP_PUBLIC_URL's *path component*, and a
-#: misconfigured path does not fail the server startup on its own — only the
-#: RFC 9728 discovery route silently lands somewhere other than
-#: '/.well-known/oauth-protected-resource/mcp'. This is the same class of
-#: silent failure as an empty MCP_ALLOWED_HOSTS, so it is caught here
-#: (DSN-006) rather than left for a client to discover. A path *prefix*
-#: (e.g. '/management/mcp') is a legitimate reverse-proxy topology (Stage 2)
-#: and must stay allowed — only an empty/root path, a trailing slash, or a
-#: final segment other than 'mcp' are rejected.
+#: TASK-009 실측 결과(FRD §5.2): SDK는 CTR-001의 well-known discovery 경로를
+#: MCP_PUBLIC_URL의 *path 구성요소*에서 유도하는데, path가 잘못 설정돼도 서버 기동은
+#: 그 자체로 실패하지 않는다 — RFC 9728 discovery 경로만 조용히
+#: '/.well-known/oauth-protected-resource/mcp'가 아닌 다른 곳으로 어긋날 뿐. 빈
+#: MCP_ALLOWED_HOSTS와 같은 부류의 조용한 실패라 클라이언트가 발견하게 두지 않고
+#: 여기서 잡는다(DSN-006). path *prefix*(예: '/management/mcp')는 정당한
+#: reverse-proxy 토폴로지(Stage 2)이므로 계속 허용해야 한다 — 거부 대상은 빈/루트
+#: path, trailing slash, 마지막 세그먼트가 'mcp'가 아닌 경우뿐이다.
 def _parse_public_url(raw: str) -> str:
     value = _parse_url(raw, "MCP_PUBLIC_URL")
     path = urlsplit(value).path
@@ -388,13 +372,12 @@ def _parse_repo_allowlist(raw: str) -> frozenset[str]:
 
 
 def _load_json_object(raw: str, key: str) -> dict[str, Any]:
-    """Parse ``raw`` as JSON and require it to be an object.
+    """``raw``를 JSON으로 파싱하고 object임을 요구한다.
 
-    ``json.loads`` returns ``Any`` — this centralizes the one cast the rest
-    of the module needs, so callers work with a properly typed dict instead
-    of re-deriving ``Unknown`` from ``isinstance`` narrowing at each call
-    site (pyright narrows ``Any`` through ``isinstance`` to ``Unknown``, not
-    ``Any``).
+    ``json.loads``는 ``Any``를 반환한다 — 나머지 모듈이 필요로 하는 cast 하나를 여기
+    한곳에 모아, 호출부마다 ``isinstance`` narrowing으로 ``Unknown``을 재도출하지 않고
+    (pyright는 ``isinstance``로 ``Any``를 narrowing하면 ``Any``가 아니라 ``Unknown``이
+    됨) 제대로 타입된 dict를 바로 쓰게 한다.
     """
     try:
         data = json.loads(raw)
@@ -406,7 +389,7 @@ def _load_json_object(raw: str, key: str) -> dict[str, Any]:
 
 
 def _as_str_list(value: object) -> list[str] | None:
-    """Return ``value`` as ``list[str]``, or ``None`` if it is not one."""
+    """``value``를 ``list[str]``로 반환, 아니면 ``None``."""
     if not isinstance(value, list):
         return None
     items = cast(list[Any], value)
@@ -420,16 +403,15 @@ def _parse_client_tokens(raw: str) -> Mapping[str, ClientToken]:
 
     tokens: dict[str, ClientToken] = {}
     problems: list[str] = []
-    # Entries are identified by ordinal position, never by echoing the token
-    # value itself — the JSON key here *is* the bearer credential, and this
-    # error can end up in logs.
+    # 항목은 순번으로만 식별 — 토큰 값 자체를 echo하지 않는다. 여기 JSON 키가 곧
+    # bearer 자격증명이고, 이 에러는 로그로 흘러갈 수 있다.
     for index, (token, entry) in enumerate(data.items(), start=1):
         if not token:
             problems.append(f"MCP_CLIENT_TOKENS entry #{index}: key must be a non-empty string")
             continue
         if len(token) < _MIN_CLIENT_TOKEN_LENGTH:
-            # The length is reported, the token is not — this message can end
-            # up in logs, and a too-short token is still a credential.
+            # 길이는 보고하되 토큰 자체는 남기지 않는다 — 이 메시지도 로그로 흘러갈 수
+            # 있고, 너무 짧은 토큰도 여전히 자격증명이다.
             problems.append(
                 f"MCP_CLIENT_TOKENS entry #{index}: token must be at least "
                 f"{_MIN_CLIENT_TOKEN_LENGTH} characters, got {len(token)}. "
@@ -476,9 +458,8 @@ def _parse_role_tools(raw: str) -> Mapping[str, frozenset[str]]:
         if tool_names is None:
             problems.append(f"MCP_ROLE_TOOLS role {role!r} must map to a list of tool names")
             continue
-        # Reject roles that grant tools the server does not actually expose —
-        # left unchecked this is a silent authorization hole (see types.py
-        # CORE_GITHUB_TOOLS docstring).
+        # 서버가 실제로 노출하지 않는 tool을 부여하는 role은 거부 — 그냥 두면 조용한
+        # 인가 구멍이 된다(types.py의 CORE_GITHUB_TOOLS docstring 참고).
         unknown = sorted(set(tool_names) - CORE_GITHUB_TOOLS)
         if unknown:
             problems.append(
@@ -506,15 +487,14 @@ def _validate_token_roles(
 
 
 def _parse_private_key(raw: str) -> str:
-    # A PEM injected as a single-line env var commonly arrives with literal
-    # "\n" escape sequences instead of real newlines; normalize before
-    # parsing.
+    # 한 줄짜리 env var로 주입된 PEM은 보통 실제 줄바꿈 대신 리터럴 "\n" 이스케이프
+    # 시퀀스로 도착한다 — 파싱 전에 정규화한다.
     normalized = raw.replace("\\n", "\n").strip()
     try:
         serialization.load_pem_private_key(normalized.encode("utf-8"), password=None)
     except (ValueError, TypeError) as exc:
-        # Never include key material in the message (EDGE-008, AC-004-3
-        # direction) — only that GITHUB_APP_PRIVATE_KEY failed to parse.
+        # 메시지에 키 자료를 절대 포함하지 않는다(EDGE-008, AC-004-3 방향) — 오직
+        # GITHUB_APP_PRIVATE_KEY 파싱 실패 사실만.
         raise _FieldError(
             f"GITHUB_APP_PRIVATE_KEY is not a valid PEM private key ({type(exc).__name__})"
         ) from exc

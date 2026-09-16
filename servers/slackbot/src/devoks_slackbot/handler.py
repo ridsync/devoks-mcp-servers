@@ -1,90 +1,65 @@
-"""ASGI composition root for the ``slack-handler`` Lambda entry point (TASK-012).
+"""``slack-handler`` Lambda 진입점의 ASGI composition root (TASK-012).
 
-``create_app(...) -> Starlette`` is the **factory** Dockerfile ``CMD`` invokes
-directly as ``uvicorn devoks_slackbot.handler:create_app --factory`` (TASK-020's
-handover expectation) -- unlike ``servers/management``'s ``app.py``, there is
-no separate ``create_app_from_env`` wrapper: ``create_app`` itself accepts no
-required arguments, loading ``HandlerSettings`` from ``os.environ`` (Fail-Fast,
-``config.load_handler_settings``) only when the caller does not supply one
-directly. Importing this module never reads the environment or raises
-``ConfigError`` -- only *calling* ``create_app()`` with no ``settings`` does,
-mirroring ``devoks_mcp_management.app``'s module-import-safety rationale.
+``create_app(...) -> Starlette``는 Dockerfile ``CMD``가 ``uvicorn
+devoks_slackbot.handler:create_app --factory``로 직접 호출하는 **팩토리**(TASK-020) --
+``servers/management``와 달리 별도 ``create_app_from_env``가 없다: ``settings``를 안
+주면 ``create_app`` 자신이 ``os.environ``에서 Fail-Fast 로드한다
+(``config.load_handler_settings``). 모듈을 import만 하는 것으로는 환경을 읽거나
+``ConfigError``를 던지지 않는다 -- ``settings`` 없이 ``create_app()``을 *호출*할 때만
+그렇다(``devoks_mcp_management.app``과 동일한 module-import-safety 원칙).
 
-Processing order (FRD §4.1 handler steps ①~⑤, §5.4 state table, and this
-workspace's ``context`` handover note, which additionally inserts the bot
-self-message check as step 3) -- **do not reorder**:
+처리 순서(FRD §4.1 handler ①~⑤, §5.4 상태표, 그리고 이 워크스페이스 handover가 3단계로
+추가한 봇 self-message 체크) -- **절대 재배치 금지**:
 
-1. **Signature verification** (``slack/signature.py``). Failure -> **401**,
-   and the body is never parsed first (``EDGE-SB-001``: verifying after
-   parsing means untrusted input was already trusted). This is also why the
-   body is read as raw bytes via ``await request.body()`` and handed to
-   ``verify_slack_signature`` unparsed/unreserialized -- ``CTR-SB-001``
-   requires the *exact* bytes Slack signed; parsing and reserializing changes
-   key order/whitespace and silently breaks verification.
-2. ``type == "url_verification"`` -> return ``challenge`` **only after**
-   signature verification has already passed (``AC-SB-001-6``,
-   ``EDGE-SB-003``). Responding before verifying would let anyone use this
-   endpoint as a free "is this URL alive" oracle.
-3. Bot self-message -> 200, no work (``EDGE-SB-011``,
-   ``slack/events.py``'s ``is_bot_self_message``) -- checked before any
-   idempotency/dispatch work starts, per that module's own docstring.
-4. **Idempotency claim** (``idempotency.claim_event``). A duplicate
-   ``event_id`` (or one that fails to claim for any reason, including
-   ``IdempotencyStoreError`` -- see ``_claim_or_fail_safe``'s docstring) means
-   no work starts, but the response is still 200 (``AC-SB-003-1``). The
-   ``x-slack-retry-num`` header (read case-insensitively; Starlette's
-   ``Headers.get`` already lowercases the lookup key regardless of how the
-   header arrived on the wire) is logged as a warning whenever present,
-   independent of the claim outcome -- its presence alone means Slack's own
-   3-second wait already elapsed once (``EDGE-SB-004``).
-5. **Async dispatch** -- a ``boto3`` Lambda ``Invoke`` (``InvocationType =
-   "Event"``) wakes ``slack-worker`` (``DSN-SB-001``). The dispatched
-   ``Payload`` is the **original, unparsed** Slack request body -- the exact
-   bytes the worker's own LWA pass-through path (``AWS_LWA_PASS_THROUGH_PATH``,
-   PLAN §1) will hand it as an HTTP request body, so the worker can parse it
-   with the very same ``slack/events.py`` functions this module uses.
-6. **Immediate 200** -- always, whether step 5 succeeded or not
-   (``AC-SB-002-3``: a failed dispatch is logged, never turned into a non-2xx
-   response, because a 500 here only makes Slack retry and add duplicates,
-   never actually recovers anything).
+1. **서명 검증**(``slack/signature.py``). 실패 시 **401**, body는 파싱 전에 검증한다
+   (``EDGE-SB-001``: 파싱 후 검증하면 이미 신뢰하지 않은 입력을 신뢰한 셈). body를 raw
+   bytes로 읽어(``await request.body()``) 파싱/재직렬화 없이 그대로
+   ``verify_slack_signature``에 넘기는 이유도 같다 -- ``CTR-SB-001``이 Slack이 서명한
+   정확한 바이트를 요구하므로, 파싱 후 재직렬화하면 key 순서/공백이 바뀌어 검증이 조용히
+   깨진다.
+2. ``type == "url_verification"`` -> 서명 검증 통과 **후에만** ``challenge`` 응답
+   (``AC-SB-001-6``, ``EDGE-SB-003``) -- 먼저 응답하면 누구나 이 엔드포인트를 무료 "URL
+   생존 확인" 오라클로 악용할 수 있다.
+3. 봇 self-message -> 200, 무처리(``EDGE-SB-011``, ``slack/events.py``의
+   ``is_bot_self_message``) -- idempotency/dispatch 작업 시작 전에 체크.
+4. **Idempotency claim**(``idempotency.claim_event``). 중복 ``event_id``(또는 어떤
+   이유로든 claim 실패 -- ``IdempotencyStoreError`` 포함, ``_claim_or_fail_safe`` 참고)면
+   무처리지만 응답은 그대로 200(``AC-SB-003-1``). ``x-slack-retry-num`` 헤더(대소문자
+   무관 조회)가 있으면 claim 결과와 무관하게 warning 로그 -- 존재 자체가 Slack의 3초
+   대기가 이미 한 번 지났다는 뜻(``EDGE-SB-004``).
+5. **비동기 dispatch** -- ``boto3`` Lambda ``Invoke(InvocationType="Event")``로
+   ``slack-worker``를 깨운다(``DSN-SB-001``). 전달되는 ``Payload``는 **원본, 미파싱**
+   Slack body 그대로 -- worker의 LWA pass-through 경로가 동일한 ``slack/events.py``
+   함수로 파싱할 수 있도록.
+6. **즉시 200** -- step 5의 성공 여부와 무관하게 항상(``AC-SB-002-3``: dispatch 실패는
+   로그만 남기고 절대 non-2xx로 바꾸지 않는다 -- 5xx는 Slack의 재시도·중복만 유발할 뿐
+   아무것도 회복하지 못한다).
 
-``AC-SB-002-2`` -- this module never calls the Claude API or the MCP server.
-No function in this file's call graph does either; see ``DSN-SB-008`` below
-for the import-level guarantee that backs this.
+``AC-SB-002-2`` -- 이 모듈은 Claude API나 MCP 서버를 절대 호출하지 않는다. 아래
+``DSN-SB-008``이 import 수준에서 이를 보장한다.
 
-🔴 ``DSN-SB-008`` -- **this module's import graph must never include
-``anthropic``** (workspace PLAN §1: measured import cost 1,384 ms, 46% of
-``CTR-SB-002``'s 3-second budget on its own). Concretely, this file must
-never import ``ask.py`` or ``worker.py`` (``ask.py`` imports ``anthropic``
-directly) -- ``TASK-013`` pins this invariant with a dedicated,
-subprocess-isolated test (``sys.modules`` accumulates across a single pytest
-process, so an in-process check here would be contaminated by whichever
-other test module happened to import ``ask.py`` first); this module's own
-test suite (``test_handler.py``) repeats that check for the same reason
-noted there.
+🔴 ``DSN-SB-008`` -- **이 모듈의 import 그래프에 ``anthropic``이 절대 섞이면 안 된다**
+(PLAN §1: import 비용 실측 1,384ms, ``CTR-SB-002`` 3초 budget의 46%). 즉 ``ask.py``나
+``worker.py``를 import하면 안 된다(``ask.py``가 ``anthropic``을 직접 import) --
+``TASK-013``이 서브프로세스 격리 테스트로 이 불변식을 고정한다(``sys.modules``는 단일
+pytest 프로세스 안에서 누적되므로 in-process 체크는 다른 테스트 모듈의 import에 오염될
+수 있음); 이 모듈 자체 테스트(``test_handler.py``)도 같은 이유로 재확인한다.
 
-🔴 Third-party SDK logger pinning (PLAN §1 "SDK DEBUG 로깅 함정") -- even
-though this module never imports ``anthropic``/``httpx2``, ``_configure_logging``
-below still pins both loggers to at least ``INFO`` by *name* (``logging.
-getLogger("anthropic")`` creates/looks up a logger object without importing
-the package). This is deliberate defense-in-depth, not dead code: configuring
-third-party SDK log verbosity is a *common entry-point responsibility*
-(``worker.py``, TASK-014, needs the identical guard for the same reason
-documented there -- ``anthropic._base_client`` logs full request bodies,
-person MCP tokens included, at DEBUG). Pinning it here as well means the
-invariant "these two loggers never exceed INFO" holds regardless of which
-Lambda's entry point runs first to configure logging in a given process, and
-costs nothing (a logger nobody's using produces no output regardless of
-level).
+🔴 서드파티 SDK 로거 고정(PLAN §1 "SDK DEBUG 로깅 함정") -- 이 모듈이 ``anthropic``/
+``httpx2``를 import하지 않아도, ``_configure_logging``이 이름으로(``logging.
+getLogger("anthropic")``는 패키지를 import하지 않고도 로거 객체를 생성/조회한다) 두
+로거를 INFO 이상으로 고정한다. 죽은 코드가 아니라 의도적 방어: SDK 로그 레벨 설정은
+진입점 공통 책임이며, worker.py(TASK-014)도 동일 가드가 필요하다
+(``anthropic._base_client``가 DEBUG에서 요청 본문 전체 -- 사람별 MCP 토큰 포함 --를
+로깅하기 때문). 여기서도 고정해두면 어느 Lambda 진입점이 먼저 로깅을 설정하든 "이 두
+로거는 INFO를 넘지 않는다"는 불변식이 유지되고, 아무도 안 쓰는 로거라 비용도 0이다.
 
-Config gap this task had to close (``WORKER_FUNCTION_NAME``)
+이 태스크가 메꾼 config 공백(``WORKER_FUNCTION_NAME``)
 ------------------------------------------------------------------
-FRD §5.2's environment-key table lists no key for the worker Lambda's
-identifier, yet ``AC-SB-002-1``/``DSN-SB-001`` require this module to
-actually invoke it. ``config.py`` (TASK-002, out of this task's nominal
-``file:`` scope but a necessary, minimal extension -- see this task's
-handover notes) now requires ``WORKER_FUNCTION_NAME`` for the handler role,
-alongside ``IDEMPOTENCY_TABLE``.
+FRD §5.2 환경변수 표에 worker Lambda 식별자 키가 없었지만, ``AC-SB-002-1``/
+``DSN-SB-001``이 실제 invoke를 요구한다. ``config.py``(TASK-002, 이 태스크의 명목상
+``file:`` 범위 밖이지만 필요한 최소 확장)가 이제 handler 역할에
+``WORKER_FUNCTION_NAME``을 ``IDEMPOTENCY_TABLE``과 함께 요구한다.
 """
 
 from __future__ import annotations
@@ -114,45 +89,41 @@ from .slack.signature import verify_slack_signature
 if TYPE_CHECKING:
     from mypy_boto3_dynamodb.client import DynamoDBClient
 
-#: The endpoint closure shape ``_make_slack_events_endpoint`` returns --
-#: named so its own signature stays readable.
+#: ``_make_slack_events_endpoint``가 반환하는 엔드포인트 클로저 타입 -- 시그니처
+#: 가독성을 위해 이름을 붙였다.
 _Endpoint = Callable[[Request], Awaitable[Response]]
 
 logger = logging.getLogger(__name__)
 
-#: TASK-024 (API Gateway route) imports this rather than hardcoding the
-#: string, so the two can never drift.
+#: TASK-024(API Gateway route)가 문자열을 하드코딩하지 않고 이 상수를 import한다 --
+#: 둘이 어긋날 수 없게.
 SLACK_EVENTS_PATH: Final[str] = "/slack/events"
 
-#: Dockerfile's ``AWS_LWA_READINESS_CHECK_PATH`` (TASK-020) must point here --
-#: without this route, Lambda Web Adapter never considers the container ready
-#: and traffic never reaches it.
+#: Dockerfile ``AWS_LWA_READINESS_CHECK_PATH``(TASK-020)가 이 경로를 가리켜야
+#: 한다 -- 없으면 Lambda Web Adapter가 컨테이너를 준비 완료로 보지 않아 트래픽이
+#: 전달되지 않는다.
 HEALTHZ_PATH: Final[str] = "/healthz"
 
-#: EDGE-SB-004. Read case-insensitively via ``Headers.get`` (see module
-#: docstring step 4) -- the constant itself only needs one casing.
+#: EDGE-SB-004. ``Headers.get``으로 대소문자 무관 조회(모듈 docstring step 4) --
+#: 상수 자체는 한 가지 표기만 있으면 된다.
 _RETRY_NUM_HEADER: Final[str] = "x-slack-retry-num"
 
-#: PLAN §1's SDK DEBUG logging trap -- see module docstring.
+#: PLAN §1의 SDK DEBUG 로깅 함정 -- 모듈 docstring 참고.
 _NOISY_SDK_LOGGER_NAMES: Final[tuple[str, ...]] = ("anthropic", "httpx2")
 _NOISY_SDK_LOGGER_MIN_LEVEL: Final[int] = logging.INFO
 
 
 class WorkerInvoker(Protocol):
-    """The one boto3 Lambda-client capability this module needs (step 5).
+    """이 모듈이 필요로 하는 boto3 Lambda 클라이언트 기능 1개(step 5).
 
-    A structural ``Protocol`` -- mirrors ``observability.py``'s
-    ``ObservationStream`` -- rather than importing ``mypy_boto3_lambda``:
-    that stub package is not part of this project's dev dependencies (only
-    ``boto3-stubs[dynamodb]`` is, for ``idempotency.py``), and adding it
-    would cost a dependency for exactly one method signature. A real
-    ``boto3.client("lambda")`` satisfies this structurally (its ``invoke``
-    accepts these exact keyword arguments); tests inject a lightweight fake
-    instead of standing up ``moto``'s heavier Lambda mocking, which requires
-    a real deployment package -- there is no conditional-write-style
-    semantic subtlety here worth paying that cost for (contrast
-    ``idempotency.py``'s module docstring, which explains why *that* module's
-    tests do use real ``moto`` DynamoDB semantics).
+    ``mypy_boto3_lambda``를 import하는 대신 구조적 ``Protocol``로 정의
+    (``observability.py``의 ``ObservationStream``과 동일 패턴) -- 그 스텁
+    패키지는 dev 의존성에 없고(``idempotency.py``용 ``boto3-stubs[dynamodb]``만
+    있음), 메서드 시그니처 하나 때문에 의존성을 추가할 이유가 없다. 실제
+    ``boto3.client("lambda")``가 구조적으로 이 Protocol을 만족한다. 테스트는
+    실배포 패키지가 필요한 ``moto``의 무거운 Lambda 모킹 대신 가벼운 fake를
+    주입한다 -- ``idempotency.py``와 달리(그쪽 모듈 docstring 참고) 조건부 쓰기
+    같은 의미론적 미묘함이 없어 그 비용을 치를 이유가 없다.
     """
 
     def invoke(
@@ -164,23 +135,21 @@ _default_lambda_client: WorkerInvoker | None = None
 
 
 def _resolve_lambda_client(client: WorkerInvoker | None) -> WorkerInvoker:
-    """Return ``client`` if given, else the lazily-built, warm-cached default.
+    """``client``가 주어지면 그대로, 아니면 지연 생성·warm 캐시된 기본값을 반환.
 
-    Mirrors ``idempotency.py``'s ``_resolve_client`` exactly, and for the
-    same reason: ``boto3.client(...)`` construction costs ~82 ms (workspace
-    PLAN §1) that a warm Lambda container should pay once, not per
-    invocation. Only ``None`` (production callers) ever reaches the caching
-    branch -- tests always inject a fake ``WorkerInvoker`` explicitly.
+    ``idempotency.py``의 ``_resolve_client``와 동일 패턴·동일 이유 --
+    ``boto3.client(...)`` 생성 비용 ~82ms(PLAN §1)는 warm Lambda 컨테이너가
+    호출마다가 아니라 한 번만 치러야 한다. 캐싱 분기는 프로덕션 호출(``None``)만
+    타며, 테스트는 항상 fake ``WorkerInvoker``를 명시적으로 주입한다.
     """
     global _default_lambda_client
     if client is not None:
         return client
     if _default_lambda_client is None:
-        # No mypy_boto3_lambda stub is installed (see WorkerInvoker's
-        # docstring), so boto3.client("lambda") resolves to an unknown type
-        # here -- cast() asserts the structural contract WorkerInvoker
-        # already documents, same role the mypy_boto3_dynamodb stub package
-        # plays for idempotency.py's own default-client cache.
+        # mypy_boto3_lambda 스텁이 없어(WorkerInvoker docstring 참고)
+        # boto3.client("lambda")가 여기서 unknown 타입으로 해석된다 -- cast()는
+        # WorkerInvoker가 이미 문서화한 구조적 계약을 단언할 뿐, idempotency.py의
+        # 기본 클라이언트 캐시에서 mypy_boto3_dynamodb 스텁이 하는 역할과 같다.
         _default_lambda_client = cast(
             "WorkerInvoker",
             boto3.client("lambda"),  # pyright: ignore[reportUnknownMemberType]
@@ -189,14 +158,12 @@ def _resolve_lambda_client(client: WorkerInvoker | None) -> WorkerInvoker:
 
 
 def _configure_logging(log_level: str) -> None:
-    """Set the root logger's threshold, then re-pin the noisy SDK loggers above it.
+    """root 로거 레벨을 설정한 뒤, 시끄러운 SDK 로거들을 그 위로 다시 고정한다.
 
-    Order matters: ``setLevel`` on the noisy loggers must run *after* the
-    root level is set, since a logger with no explicit level of its own
-    would otherwise inherit whatever the operator just raised the root to
-    (e.g. ``SLACKBOT_LOG_LEVEL=DEBUG`` for incident response) -- see module
-    docstring's "SDK 로깅 함정" section for why that specific scenario is the
-    one this function exists to prevent.
+    순서가 중요하다: 시끄러운 로거의 ``setLevel``은 반드시 root 레벨 설정 *이후*에
+    실행돼야 한다 -- 그렇지 않으면 자체 레벨이 없는 로거는 운영자가 방금 올린 root
+    레벨(예: 장애 대응용 ``SLACKBOT_LOG_LEVEL=DEBUG``)을 그대로 상속한다. 이 함수가
+    막으려는 시나리오가 정확히 그것 -- 모듈 docstring "SDK 로깅 함정" 절 참고.
     """
     logging.getLogger().setLevel(log_level)
     for name in _NOISY_SDK_LOGGER_NAMES:
@@ -204,11 +171,11 @@ def _configure_logging(log_level: str) -> None:
 
 
 async def _healthz(request: Request) -> Response:
-    """GET /healthz -- unauthenticated by design (LWA readiness probe, TASK-020).
+    """GET /healthz -- 설계상 인증 없음(LWA readiness probe, TASK-020).
 
-    Body is deliberately minimal: no settings, no identity, nothing beyond
-    "this process can answer HTTP requests" -- a public, unauthenticated
-    route must never echo back configuration.
+    응답 본문은 의도적으로 최소 -- 설정도 identity도 없이 "이 프로세스가 HTTP
+    요청에 응답할 수 있다"는 사실만. 인증 없는 공개 라우트가 설정값을 되돌려주면
+    안 된다.
     """
     return JSONResponse({"status": "ok"})
 
@@ -218,15 +185,14 @@ def _make_slack_events_endpoint(
     lambda_client: WorkerInvoker | None,
     idempotency_client: DynamoDBClient | None,
 ) -> _Endpoint:
-    """Build the ``POST SLACK_EVENTS_PATH`` endpoint closure for one ``settings``/client pair.
+    """``settings``/client 한 쌍에 대한 ``POST SLACK_EVENTS_PATH`` 엔드포인트 클로저를 만든다.
 
-    A closure (not a bare module-level function) because the endpoint needs
-    ``settings`` (the signing secret, the worker's ``FunctionName``, ...) and
-    the two optional injected clients (``lambda_client``/``idempotency_client``,
-    both test-only -- production always leaves them ``None`` and lets
-    ``_resolve_lambda_client``/``idempotency.claim_event``'s own default
-    resolve lazily). ``create_app`` builds a fresh closure per call, matching
-    its own "independent instances" guarantee.
+    모듈 레벨 함수가 아니라 클로저인 이유: 엔드포인트가 ``settings``(signing
+    secret, worker ``FunctionName`` 등)와 테스트 전용 주입 클라이언트 2개
+    (``lambda_client``/``idempotency_client``, 프로덕션은 항상 ``None``으로 두고
+    ``_resolve_lambda_client``/``idempotency.claim_event``의 기본값이 지연
+    resolve하게 둠)를 필요로 하기 때문. ``create_app``은 호출마다 새 클로저를
+    만들어 "독립적 인스턴스" 보장을 그대로 유지한다.
     """
 
     async def _slack_events(request: Request) -> Response:
@@ -235,8 +201,7 @@ def _make_slack_events_endpoint(
         if not verify_slack_signature(
             headers=request.headers, raw_body=raw_body, signing_secret=settings.signing_secret
         ):
-            # EDGE-SB-001: rejected on the signature alone -- raw_body is
-            # never parsed on this path.
+            # EDGE-SB-001: 서명만으로 거부 -- 이 경로에서 raw_body는 절대 파싱하지 않는다.
             return PlainTextResponse("unauthorized", status_code=401)
 
         try:
@@ -250,18 +215,18 @@ def _make_slack_events_endpoint(
         payload = cast(dict[str, Any], parsed_body)
 
         if is_url_verification(payload):
-            # AC-SB-001-6 / EDGE-SB-003: only reachable once verify_slack_signature
-            # above has already returned True.
+            # AC-SB-001-6 / EDGE-SB-003: 위 verify_slack_signature가 True를 반환한
+            # 이후에만 도달 가능.
             challenge = extract_challenge(payload)
             return JSONResponse({"challenge": challenge})
 
         if is_bot_self_message(payload, bot_user_id=settings.bot_user_id):
-            # EDGE-SB-011: checked before any idempotency/dispatch work.
+            # EDGE-SB-011: idempotency/dispatch 작업 전에 체크.
             return PlainTextResponse("ok")
 
         if request.headers.get(_RETRY_NUM_HEADER) is not None:
-            # EDGE-SB-004: presence alone (any value) means Slack's own
-            # 3-second wait already elapsed once for this event.
+            # EDGE-SB-004: 값과 무관하게 헤더 존재 자체가 Slack의 3초 대기가
+            # 이미 한 번 지났다는 뜻.
             logger.warning(
                 "slack retry received (event_id=%s, %s=%s)",
                 extract_event_id(payload),
@@ -272,7 +237,7 @@ def _make_slack_events_endpoint(
         event_id = extract_event_id(payload)
         claim_outcome = _claim_or_fail_safe(event_id, settings=settings, client=idempotency_client)
         if not claim_outcome.claimed:
-            # AC-SB-003-1: duplicate/unclaimable -- 200, no dispatch.
+            # AC-SB-003-1: 중복/claim 실패 -- 200, dispatch 없음.
             return PlainTextResponse("ok")
 
         _dispatch_to_worker(raw_body, settings=settings, client=lambda_client)
@@ -284,27 +249,21 @@ def _make_slack_events_endpoint(
 def _claim_or_fail_safe(
     event_id: str | None, *, settings: HandlerSettings, client: DynamoDBClient | None
 ) -> ClaimOutcome:
-    """Wrap ``idempotency.claim_event`` so a store outage degrades to "no work, still 200".
+    """``idempotency.claim_event``를 감싸 저장소 장애를 "무처리, 그래도 200"으로 격하시킨다.
 
-    Not itself required by any single AC the way ``AC-SB-002-3`` is (that one
-    names the *dispatch* step specifically) -- this is this task's own
-    defined answer for what the context handover calls "멱등 저장소 오류
-    (``IdempotencyStoreError``) 시의 정의된 동작". The reasoning mirrors
-    ``AC-SB-002-3``'s: if the idempotency store itself is unreachable, this
-    module cannot tell "new" from "duplicate" -- proceeding to dispatch
-    anyway would risk exactly the double-answer/double-spend outcome the
-    whole idempotency mechanism exists to prevent, so the fail-safe choice is
-    to skip dispatch for this one event (logged at ERROR, operator-visible)
-    rather than risk a duplicate. A 500 is never returned either way, for the
-    same reason ``AC-SB-002-3`` gives: Slack would only retry into the same
-    broken store.
+    ``AC-SB-002-3``처럼 특정 AC가 명시한 요구는 아니다(그쪽은 *dispatch* 단계
+    한정) -- 이건 컨텍스트 handover가 말한 "멱등 저장소 오류
+    (``IdempotencyStoreError``) 시의 정의된 동작"에 대한 이 태스크 자체의 답.
+    근거는 ``AC-SB-002-3``과 동일: 저장소 자체가 응답 불가면 "신규"와 "중복"을
+    구분할 수 없다 -- 그대로 dispatch하면 idempotency 메커니즘이 막으려는 중복
+    응답을 그대로 낼 위험이 있으므로, fail-safe하게 이 이벤트 하나의 dispatch만
+    건너뛴다(ERROR 로그, 운영자 가시). 500은 절대 반환하지 않는다 -- Slack이
+    같은 고장난 저장소로 재시도만 유발할 뿐이라는 ``AC-SB-002-3``과 같은 이유.
 
-    The returned ``reason="store_error"`` (never ``"missing_event_id"``,
-    even though ``event_id`` may well be present here) is what lets an
-    operator tell "the store itself is unreachable" apart from "events keep
-    arriving without an id" -- see ``idempotency.ClaimReason``'s own comment
-    for why conflating the two would be a real diagnostic regression, not a
-    cosmetic one.
+    반환값 ``reason="store_error"``(``event_id``가 실제로 있어도
+    ``"missing_event_id"``가 아님)는 운영자가 "저장소 자체가 응답 불가"와
+    "이벤트에 id가 계속 없음"을 구분하게 해준다 -- 둘을 섞으면 진단 퇴행이라는
+    점은 ``idempotency.ClaimReason``의 주석 참고.
     """
     try:
         return claim_event(
@@ -325,15 +284,15 @@ def _claim_or_fail_safe(
 def _dispatch_to_worker(
     raw_body: bytes, *, settings: HandlerSettings, client: WorkerInvoker | None
 ) -> None:
-    """Invoke ``slack-worker`` asynchronously (``AC-SB-002-1``). Never raises.
+    """``slack-worker``를 비동기 invoke한다(``AC-SB-002-1``). 절대 예외를 던지지 않는다.
 
-    ``AC-SB-002-3``: any failure here (throttling, a missing/misconfigured
-    function, a network error, or any other exception) is logged and
-    swallowed -- deliberately caught as bare ``Exception``, broader than
-    ``idempotency.py``'s ``(BotoCoreError, ClientError)`` pattern, because
-    this AC is unconditional ("비동기 전달 *자체가* 실패하면") with no carve-out
-    for a failure this module didn't anticipate; the one behavior it must
-    never produce is a non-2xx response caused by this step.
+    ``AC-SB-002-3``: 여기서 발생하는 어떤 실패든(throttling, 함수 미존재/설정
+    오류, 네트워크 오류, 그 외 모든 예외) 로그만 남기고 삼킨다 -- 의도적으로
+    broad한 bare ``Exception``으로 캐치, ``idempotency.py``의
+    ``(BotoCoreError, ClientError)``보다 넓은 범위인 이유는 이 AC가
+    "비동기 전달 *자체가* 실패하면"이라는 무조건 요구라 이 모듈이 예상 못한
+    실패에도 예외를 두지 않기 때문. 이 단계가 절대 만들면 안 되는 유일한
+    결과는 non-2xx 응답이다.
     """
     resolved_client = _resolve_lambda_client(client)
     try:
@@ -352,24 +311,22 @@ def create_app(
     lambda_client: WorkerInvoker | None = None,
     idempotency_client: DynamoDBClient | None = None,
 ) -> Starlette:
-    """Build one Starlette app for the ``slack-handler`` Lambda, from ``settings``.
+    """``settings``로부터 ``slack-handler`` Lambda용 Starlette 앱 하나를 만든다.
 
-    ``settings`` defaults to ``None``, in which case it is loaded from
-    ``os.environ`` via ``load_handler_settings`` (Fail-Fast) -- this is what
-    lets ``create_app`` itself be the zero-argument callable
-    ``uvicorn devoks_slackbot.handler:create_app --factory`` needs (Dockerfile
-    ``CMD``, TASK-020), with no separate ``create_app_from_env`` wrapper.
-    Passing ``settings`` explicitly (every test in this package's suite does)
-    bypasses environment access entirely.
+    ``settings`` 기본값은 ``None`` -- 이 경우 ``load_handler_settings``로
+    ``os.environ``에서 Fail-Fast 로드한다. 덕분에 ``create_app`` 자신이 별도
+    ``create_app_from_env`` 래퍼 없이 Dockerfile ``CMD``(TASK-020)가 요구하는
+    무인자 콜러블 ``uvicorn devoks_slackbot.handler:create_app --factory``가
+    된다. ``settings``를 명시적으로 주면(이 패키지의 모든 테스트가 그렇게 함)
+    환경 접근을 완전히 우회한다.
 
-    ``lambda_client``/``idempotency_client`` are test-only injection points
-    (both ``None`` in every real deployment) -- see ``WorkerInvoker`` and
-    ``idempotency.claim_event``'s own ``client`` parameter for what each
-    accepts.
+    ``lambda_client``/``idempotency_client``는 테스트 전용 주입 지점(실배포는
+    항상 ``None``) -- 각각 무엇을 받는지는 ``WorkerInvoker``와
+    ``idempotency.claim_event``의 ``client`` 파라미터 참고.
 
-    A factory, not a module-level singleton -- call this once per process (or
-    once per ``HandlerSettings`` in a test); each call builds independent
-    objects, never sharing route closures across calls.
+    모듈 레벨 싱글턴이 아니라 팩토리 -- 프로세스당 한 번(또는 테스트에서
+    ``HandlerSettings``당 한 번) 호출한다. 호출마다 독립된 객체를 만들며 라우트
+    클로저를 호출 간에 공유하지 않는다.
     """
     resolved_settings = settings if settings is not None else load_handler_settings(os.environ)
     _configure_logging(resolved_settings.log_level)

@@ -1,39 +1,22 @@
-"""Tool guard decorator (TASK-007, DSN-003, FRD §4.1 step ③).
+"""툴 가드 데코레이터(TASK-007, DSN-003, FRD §4.1 ③단계).
 
-This is the "③ 툴 래퍼 (``@guarded``)" box in the FRD's data-flow diagram: it
-sits between the SDK's own auth layer (which already resolved ``AccessToken``
-or 401'd the request before a tool wrapper ever runs) and each tool's body.
-It has three jobs, all enforced in one place so a tool author cannot forget
-one of them by writing the body first:
+FRD 데이터 흐름도의 "③ 툴 래퍼" 박스 — SDK 인증 계층(이미 ``AccessToken``을
+해석했거나 401 반환)과 각 tool 본문 사이에서 세 가지를 한곳에 강제한다:
 
-1. Run ``auth.policy.authorize`` *before* the body — a denial never reaches
-   the tool, so a denied call never touches GitHub (AC-003-2, AC-003-3).
-2. Emit exactly one ``CTR-003`` audit record per call, for every outcome —
-   ``ok``, ``denied`` (AC-004-2), or ``error`` (AC-004-4) — via
-   ``try/except/else/finally`` so an exception from the body can never skip
-   the audit emit.
-3. Normalize whatever the body raises into something safe to hand back to
-   the client: a deliberate ``mcp.server.mcpserver.exceptions.ToolError`` (or
-   ``ResourceError``/``mcp.MCPError``) passes through unchanged — the SDK's
-   own contract already treats those as client-safe, and a downstream tool
-   (TASK-021/022's GitHub error normalization) depends on its own
-   ``ToolError`` messages reaching the model intact. Anything else is an
-   unanticipated crash (EDGE-009): the traceback goes to the server log via
-   ``logging`` (never to the client, never to the audit record — the audit
-   only ever gets ``error_kind``, the exception's class name), and the
-   client gets a generic, request-id-bearing message with no trace of the
-   original exception text.
+1. 본문 실행 *전에* ``auth.policy.authorize`` 호출 — 거부 시 본문에 닿지
+   않으므로 GitHub를 절대 건드리지 않는다(AC-003-2, AC-003-3).
+2. ``ok``/``denied``(AC-004-2)/``error``(AC-004-4) 모든 결과에 대해
+   ``CTR-003`` 감사 레코드를 정확히 1건 emit — ``try/except/else/finally``로
+   감싸 본문 예외가 emit을 건너뛸 수 없게 한다.
+3. 예외 정규화 — 의도적 ``ToolError``/``ResourceError``/``mcp.MCPError``는
+   그대로 통과(SDK 계약상 client-safe, TASK-021/022의 GitHub 에러 정규화가
+   자신의 메시지가 그대로 도달함에 의존). 그 외는 예기치 않은 크래시
+   (EDGE-009) — 트레이스백은 서버 로그에만, 감사엔 ``error_kind``(예외
+   클래스명)만, 클라이언트엔 원문 없이 request_id 포함 일반 메시지만.
 
-Why a factory (``make_tool_guard``) rather than a bare decorator
--------------------------------------------------------------------
-The decorator needs a ``Settings`` (for ``role_tools``/``repo_allowlist``)
-and an emit sink, and every audit field that is normally "ambient" —
-``ts``, ``duration_ms``, ``request_id`` — has to be swappable for a test to
-assert on it deterministically. Reading ``Settings`` from a module-global or
-calling ``time.time()``/``uuid.uuid4()`` directly would make both
-impossible without patching globals. ``make_tool_guard(settings, *, emit=,
-clock=, timestamp_factory=, request_id_factory=)`` takes all of that by
-injection and returns ``guard``, the actual per-tool decorator factory:
+**팩토리(``make_tool_guard``)인 이유**: ``Settings``와 emit sink가
+필요하고 ``ts``/``duration_ms``/``request_id`` 같은 환경값도 테스트가
+결정론적으로 검증하려면 주입 가능해야 한다.
 
     guard = make_tool_guard(settings)
 
@@ -41,88 +24,57 @@ injection and returns ``guard``, the actual per-tool decorator factory:
     async def read_file(repo: str, path: str, ref: str | None = None) -> str:
         ...
 
-``clock`` is ``time.perf_counter`` by default (monotonic) rather than
-``time.time`` — an NTP step during a call must never produce a negative
-``duration_ms``.
+``clock`` 기본값이 ``time.time``이 아니라 ``time.perf_counter``(모노토닉)
+인 이유는 NTP 보정으로 ``duration_ms``가 음수가 되는 걸 막기 위함.
 
-Why ``repo_arg``/``audit_args`` are named, not inferred
-------------------------------------------------------------
-Every tool's argument shape differs (``list_repos`` has no repository
-argument at all; ``read_file`` does). Guessing which parameter is "the repo"
-from its name is exactly the kind of heuristic that goes quietly wrong the
-day a parameter is renamed — and a wrong guess here does not fail loudly, it
-authorizes a call it should have checked against the allowlist. So the tool
-author names the parameter explicitly per call to ``guard(...)``; a tool
-that does not pass ``repo_arg`` is authorized with ``repo=None`` (skips the
-allowlist check, matching ``auth.policy.authorize``'s own contract for
-repo-less tools). The same reasoning applies to ``audit_args``: this module
-never dumps "every keyword argument" into ``args_summary``, because that
-would make a future parameter (say, a tool grows a ``content`` argument)
-leak into the audit log by default. Only the names the caller opts in
-through ``audit_args`` are ever stringified into the record — the
-identifying arguments CTR-003 asks for (repo, path, ref, query), never a
-file body or a tool's return value, which this module never even looks at
-for anything other than the ``else`` branch's ``return result``.
+**``repo_arg``/``audit_args``를 추론이 아니라 이름으로 받는 이유**: 이름으로
+"이게 repo다"를 추측하면 파라미터 리네임 시 조용히 어긋나고, 잘못된 추측은
+allowlist 체크를 건너뛴 채 승인해버려 위험하다. ``repo_arg`` 미지정 tool은
+``repo=None``으로 인가된다(``authorize()``의 repo-less tool 계약과 동일).
+같은 이유로 kwargs 전부를 ``args_summary``에 덤프하지 않고 ``audit_args``로
+명시한 이름만 문자열화한다(미래에 tool이 ``content`` 인자를 추가해도
+기본으로 새지 않도록). CTR-003이 요구하는 식별용 인자(repo, path, ref,
+query)만 남기고, 파일 본문·tool 반환값은 절대 포함하지 않는다(반환값은
+``else`` 분기의 ``return result``에서만 다룬다).
 
-Why identity ``None`` is a fail-safe *deny*, not a pass-through
-----------------------------------------------------------------
-``mcp.server.auth.middleware.auth_context.get_access_token()`` returns
-``None`` on any request that never went through the SDK's HTTP bearer-auth
-middleware — stdio transport, or the in-memory ``Client(mcp)`` test
-transport (FRD §7). Over Streamable HTTP, the SDK's own auth middleware
-already turns a missing/invalid token into a 401 before a tool wrapper ever
-runs, so ``None`` reaching *this* code means the call arrived by a path with
-no authentication layer in front of it at all. Treating that as "role
-unknown, deny" is what keeps RBAC meaningful the moment this server is ever
-run over stdio instead: the alternative (treat ``None`` as some default
-role) would make every stdio deployment fully open, silently.
+**identity ``None``이 fail-safe *거부*인 이유**: ``get_access_token()``은
+HTTP bearer-auth 미들웨어를 거치지 않은 요청(stdio, 인메모리
+``Client(mcp)`` 테스트 전송, FRD §7)에서 ``None``을 반환한다. Streamable
+HTTP는 이미 미들웨어에서 401 처리하므로, 여기 ``None``이 왔다는 건 인증
+계층 자체를 거치지 않았다는 뜻 — "role 미상, 거부"로 처리해야 이 서버가
+stdio로 돌아가도 RBAC가 조용히 무력화되지 않는다. 감사 레코드의
+``client_id``/``role``은 진짜 ``AccessToken``이 없으므로 둘 다
+``"anonymous"``로 남긴다(``config.py``가 빈 role/토큰을 거부하므로 원래
+불가능한 빈 값 ``""``과 혼동될 일이 없는 리터럴). ``reason_code``는
+``auth.policy``의 ``"role_unknown"``이 아니라 더 구체적인 ``"no_identity"``
+를 쓴다(구현은 빈 문자열 role로 ``authorize()``를 호출해 ``role_unknown``
+분기의 거부 문자열만 재사용하는 것뿐이지만, 감사 쪽 reason은 운영상 의미가
+다른 신호다) — 운영자가 로그에서 "왜 HTTP 인증 없이 tool에 도달했지?"를
+물어야지 "왜 이 role에 이 tool이 없지?"를 묻게 하면 안 되기 때문.
 
-The audit record for that case cannot carry a real ``client_id``/``role`` —
-there is no ``AccessToken`` to read one from — so both fields are recorded
-as the literal string ``"anonymous"`` (picked over ``""`` so a log query for
-this exact condition cannot be confused with an — otherwise impossible,
-since ``config.py`` rejects empty role names and token rows always have a
-``client_id`` — empty value from a real token). The audit ``reason_code``
-is the more specific ``"no_identity"`` rather than ``auth.policy``'s
-``"role_unknown"``, even though this path is implemented by calling
-``authorize()`` with an empty-string role (guaranteed to never match a
-configured role, so it always resolves through ``authorize()``'s own
-``role_unknown`` branch) purely to obtain the single canonical
-client-facing denial string without duplicating that literal here. The
-*audit* reason is overridden to ``"no_identity"`` because it is a
-meaningfully different operational signal from a genuine RBAC
-misconfiguration: an operator seeing ``"no_identity"`` in the logs should
-ask "why did a request reach a tool without going through HTTP auth?", not
-"why isn't this role assigned this tool?".
-
-**Consequence for TASK-024 (GitHub tools' in-memory integration tests):**
-because ``Client(mcp)`` bypasses HTTP auth, every tool call in an in-memory
-test is denied by this fail-safe unless the test first does
+**TASK-024(GitHub tool 인메모리 통합 테스트) 영향**: ``Client(mcp)``는
+HTTP 인증을 우회하므로, 아래처럼 먼저 ``auth_context_var``를 설정하지
+않으면 인메모리 테스트의 모든 tool 호출이 이 fail-safe에 걸려 거부된다.
 
     from mcp.server.auth.middleware.auth_context import auth_context_var
     from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 
     token = auth_context_var.set(AuthenticatedUser(access_token))
     try:
-        ...  # call the tool
+        ...  # tool 호출
     finally:
         auth_context_var.reset(token)
 
-before calling a guarded tool. Skipping this makes every call fail with the
-fixed denial message, which looks like a policy bug rather than a missing
-test fixture.
+빠뜨리면 모든 호출이 고정된 거부 메시지로 실패해 정책 버그처럼 보이지만
+실제론 테스트 fixture 누락이다.
 
-Async-only, on purpose
------------------------
-SDK v2 tools are async by default (a sync ``def`` tool is run on a worker
-thread by the SDK itself), and every tool this Stage introduces (the GitHub
-adapter, TASK-020-022) is async. Wrapping sync tools too would mean this
-module re-implementing the SDK's own thread-offload machinery for a case
-nothing in this codebase needs — so ``guard`` only wraps
-``Callable[..., Awaitable[Any]]`` and raises ``TypeError`` at decoration
-time (not at call time) if handed a non-coroutine function, so a mistake is
-caught immediately rather than surfacing as a confusing runtime failure
-inside ``await fn(...)``.
+**Async 전용인 이유**: SDK v2 tool은 기본이 async(sync ``def`` tool은 SDK가
+알아서 워커 스레드에서 돌림)이고, 이 Stage가 추가하는 tool(TASK-020-022)도
+전부 async다. sync tool까지 감싸려면 이 모듈이 SDK의 스레드 오프로드를
+다시 구현해야 하는데 불필요한 케이스다. 그래서 ``guard``는
+``Callable[..., Awaitable[Any]]``만 감싸고, 코루틴 함수가 아니면 호출
+시점이 아니라 **데코레이션 시점**에 ``TypeError``를 던져 실수를 즉시
+드러낸다(``await fn(...)`` 안의 알 수 없는 런타임 실패로 미루지 않는다).
 """
 
 from __future__ import annotations
@@ -156,16 +108,10 @@ __all__ = ["make_tool_guard"]
 
 logger = logging.getLogger(__name__)
 
-#: Bound to any async tool body. The wrapper is functionally
-#: call-compatible with ``fn`` (same signature, same return value on
-#: success), which is what the ``cast(F, wrapper)`` at the bottom of
-#: ``decorator`` documents — mirroring the ``functools.wraps``-preserves-the-
-#: signature idiom used because a plain ``ParamSpec`` here would need a
-#: second level of genericity (a decorator *factory*, not a decorator) that
-#: only a dedicated ``Generic`` wrapper class (see typeshed's
-#: ``functools._Wrapped``) expresses precisely — overkill for a wrapper
-#: whose callers are the MCP SDK's own dynamic, kwargs-based dispatch, not
-#: statically type-checked call sites in this codebase.
+#: 모든 async tool 본문에 바인딩. wrapper는 ``fn``과 시그니처·반환값이
+#: 동일하다(``decorator`` 하단의 ``cast(F, wrapper)``가 이를 문서화).
+#: ``ParamSpec``은 데코레이터 팩토리라는 2단 제네릭이 필요해 overkill —
+#: 호출부가 MCP SDK의 동적 kwargs 디스패치라 정적 타입체크 이득도 적다.
 F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
 
 AuditEmitter = Callable[[AuditRecord], None]
@@ -173,32 +119,28 @@ Clock = Callable[[], float]
 TimestampFactory = Callable[[], str]
 RequestIdFactory = Callable[[], str]
 
-#: See "Why identity None is a fail-safe deny" above.
+#: "identity None이 fail-safe 거부인 이유" 참고(모듈 docstring).
 _NO_IDENTITY_SENTINEL = "anonymous"
 _NO_IDENTITY_REASON_CODE = "no_identity"
 
-#: Never a real role (``config.py`` rejects empty ``MCP_ROLE_TOOLS`` keys),
-#: so passing this to ``authorize()`` always resolves through its
-#: ``role_unknown`` deny branch — used both when there is no identity at all
-#: and when an ``AccessToken`` carries no role claim.
+#: 실제 role일 수 없음(``config.py``가 빈 ``MCP_ROLE_TOOLS`` 키를 거부) —
+#: ``authorize()``에 넘기면 항상 ``role_unknown`` 분기로 귀결. identity가
+#: 아예 없거나 ``AccessToken``에 role claim이 없을 때 공통으로 쓰인다.
 _UNKNOWN_ROLE_SENTINEL = ""
 
-#: Stands in for a named ``repo_arg`` that arrived as something other than a
-#: ``str`` (TASK-045). It must be non-``None`` and must never be an element
-#: of ``repo_allowlist``: ``authorize()`` skips the repo check entirely when
-#: ``repo is None``, so returning ``None`` for a malformed argument was
-#: **fail-open** — ``read_file(repo=123, ...)`` was authorized without the
-#: ``CTR-008`` allowlist check ever running, and the audit record showed no
-#: denial. The ``\x00`` prefix guarantees non-membership: ``config.py``'s
-#: ``_REPO_ALLOWLIST_ENTRY`` only admits ``owner/repo`` spellings, so no
-#: configured entry can contain a null byte. The resulting decision is
-#: ``denied`` / ``repo_not_allowlisted``, which is also the truthful
-#: classification — a non-string repository is not on the allowlist.
+#: 이름 있는 ``repo_arg``가 ``str``이 아닌 값으로 온 경우의 대체값
+#: (TASK-045). ``None``이면 안 된다 — ``authorize()``는 ``repo is None``일
+#: 때 repo 체크를 통째로 건너뛰므로, 잘못된 타입에 ``None``을 반환하면
+#: **fail-open**이었다(``read_file(repo=123, ...)``이 allowlist 체크 없이
+#: 승인되고 감사 레코드엔 거부 흔적조차 안 남음). ``\x00`` 접두사는
+#: ``config.py``의 ``_REPO_ALLOWLIST_ENTRY``가 널바이트를 허용하지 않으므로
+#: 어떤 설정값과도 절대 매치되지 않음을 보장 — 결과는 truthful하게
+#: ``denied``/``repo_not_allowlisted``.
 #:
-#: In practice the MCP SDK validates tool arguments against the tool's
-#: signature before the guard runs (a wrong-typed ``repo`` is rejected as a
-#: pydantic validation error), so this is defense in depth for the case where
-#: that layer changes or is bypassed — not a currently reachable path.
+#: 실제로는 MCP SDK가 guard 실행 전에 tool 인자를 시그니처로 검증해
+#: 타입이 틀린 ``repo``를 pydantic 검증 에러로 거부하므로, 이건 그 계층이
+#: 바뀌거나 우회될 경우를 대비한 defense-in-depth다 — 현재 도달 가능한
+#: 경로는 아니다.
 _MALFORMED_REPO_SENTINEL = "\x00-repo-arg-was-not-a-string"
 
 
@@ -218,15 +160,13 @@ def make_tool_guard(
     timestamp_factory: TimestampFactory = _default_timestamp,
     request_id_factory: RequestIdFactory = _default_request_id,
 ) -> Callable[..., Callable[[F], F]]:
-    """Build the ``guard`` decorator factory for one server instance.
+    """서버 인스턴스 1개용 ``guard`` 데코레이터 팩토리를 만든다.
 
-    ``settings`` supplies ``role_tools``/``repo_allowlist`` to
-    ``auth.policy.authorize``. ``emit``/``clock``/``timestamp_factory``/
-    ``request_id_factory`` default to the real implementations
-    (``audit.logger.emit``, ``time.perf_counter``, wall-clock ISO 8601,
-    ``uuid4``) and exist to be overridden by tests — see the module
-    docstring for why ambient time/identity sources make deterministic
-    testing impossible otherwise.
+    ``settings``는 ``auth.policy.authorize``에 넘길 ``role_tools``/
+    ``repo_allowlist``를 제공한다. ``emit``/``clock``/``timestamp_factory``/
+    ``request_id_factory``는 실제 구현(``audit.logger.emit``,
+    ``time.perf_counter``, wall-clock ISO 8601, ``uuid4``)이 기본값이고
+    테스트가 교체할 수 있도록 존재한다 — 이유는 모듈 docstring 참고.
     """
 
     def guard(
@@ -235,17 +175,14 @@ def make_tool_guard(
         repo_arg: str | None = None,
         audit_args: tuple[str, ...] = (),
     ) -> Callable[[F], F]:
-        """Decorator for one tool. See the module docstring for the full contract.
+        """tool 1개용 데코레이터. 전체 계약은 모듈 docstring 참고.
 
-        ``tool`` is the CTR-007 tool name checked against
-        ``role_tools``/recorded in the audit line — independent of the
-        wrapped function's own ``__name__``, so a tool can be registered
-        under a name distinct from its Python identifier if needed.
-        ``repo_arg`` names the parameter (if any) holding the repository
-        this call targets; omit it for a tool with no single-repo argument.
-        ``audit_args`` names the parameters to stringify into
-        ``args_summary`` (``repo_arg``, if given, is always included even if
-        omitted from ``audit_args``).
+        ``tool``은 ``role_tools``/감사 레코드에 쓰이는 CTR-007 tool 이름 —
+        래핑된 함수의 ``__name__``과 무관하므로 Python 식별자와 다른
+        이름으로 등록 가능. ``repo_arg``는 이 호출이 대상으로 하는 repo를
+        담은 파라미터 이름(없으면 생략). ``audit_args``는 ``args_summary``
+        에 문자열화할 파라미터 이름들(``repo_arg``는 ``audit_args``에
+        없어도 항상 포함).
         """
         log_arg_names = tuple(dict.fromkeys((*audit_args, *((repo_arg,) if repo_arg else ()))))
 
@@ -314,12 +251,12 @@ def make_tool_guard(
                     reason_code = decision.reason_code
                     assert client_message is not None  # policy guarantees this when denied
                     assert reason_code is not None
-                    # AC-003-2 / AC-004-2: audited, body never runs. `client_id`
-                    # already collapsed to the sentinel above when there is no
-                    # identity; `role`/`reason_code` need the same override
-                    # here since `effective_role`/`decision.reason_code` carry
-                    # the "" / "role_unknown" values authorize() produced for
-                    # the sentinel role, not the no-identity-specific ones.
+                    # AC-003-2 / AC-004-2: 감사엔 남기되 본문은 실행 안 함.
+                    # `client_id`는 identity 없을 때 이미 위에서 sentinel로
+                    # 치환됐고, `role`/`reason_code`도 여기서 같은 이유로
+                    # override — `effective_role`/`decision.reason_code`는
+                    # sentinel role에 대해 authorize()가 만든
+                    # ""/"role_unknown" 값이지 no-identity 전용 값이 아니다.
                     record(
                         outcome="denied",
                         client_id=client_id,
@@ -330,38 +267,34 @@ def make_tool_guard(
 
                 outcome: AuditOutcome = "ok"
                 error_kind: str | None = None
-                # TASK-049: set only by the SecurityBoundaryError clause and
-                # read by the `finally` block below, which is the single
-                # emit site for this call. Adding a second `record()` inside
-                # an `except` would emit *two* audit lines for one tool call.
+                # TASK-049: SecurityBoundaryError 분기에서만 설정되고 아래
+                # `finally`(이 호출의 유일한 emit 지점)에서 읽힌다. `except`
+                # 안에 `record()`를 추가하면 tool 호출 1건에 감사 줄이
+                # 2개 생긴다.
                 security_reason_code: SecurityReasonCode | None = None
                 try:
                     result = await fn(*args, **kwargs)
                 except SecurityBoundaryError as exc:
-                    # TASK-049. Must precede the general ToolError clause
-                    # below — SecurityBoundaryError *is* a ToolError, so a
-                    # broader clause placed first would swallow it and the
-                    # record would go back to `error`/`ToolError`.
+                    # TASK-049. 아래 일반 ToolError 분기보다 먼저 와야 한다
+                    # — SecurityBoundaryError는 ToolError의 서브클래스라,
+                    # 순서가 바뀌면 여기서 못 잡고 `error`/`ToolError`로
+                    # 기록된다.
                     #
-                    # Classified `denied`, not `error`, because that is the
-                    # bucket an operator queries when asking "is anyone
-                    # probing our boundaries?". Every other boundary refusal
-                    # (`repo_not_allowlisted`, `tool_not_permitted`) already
-                    # lands there; leaving allowlist-escape attempts in
-                    # `error` put them next to "file not found" and "rate
-                    # limited", where they are indistinguishable from noise.
+                    # `error`가 아니라 `denied`로 분류하는 이유: "누가
+                    # 경계를 찔러보고 있나?"를 조회하는 버킷이 `denied`이기
+                    # 때문 — 다른 경계 거부(`repo_not_allowlisted`,
+                    # `tool_not_permitted`)도 전부 거기 있다. `error`에
+                    # 두면 "file not found", "rate limited"와 구분이 안
+                    # 된다.
                     #
-                    # Re-raised unchanged (not converted): the exception is
-                    # already a client-safe ToolError whose message names only
-                    # the violated rule, so the caller sees exactly what it
-                    # saw before this task — AC-003-5's "every denial looks
-                    # identical to the caller" is preserved while the audit
-                    # line gains a queryable reason_code.
+                    # 예외는 변환 없이 그대로 재발생 — 이미 client-safe한
+                    # ToolError이고 메시지엔 위반 규칙만 담기므로 호출자가
+                    # 보는 결과는 이전과 동일(AC-003-5), 감사 줄에만 조회
+                    # 가능한 reason_code가 추가된다.
                     #
-                    # `error_kind` stays None: this is a refusal, not a
-                    # failure, and CTR-003 keeps the two fields separate
-                    # precisely so a log query can tell them apart without
-                    # parsing values.
+                    # `error_kind`는 None 유지 — 이건 실패가 아니라 거부이고,
+                    # CTR-003이 두 필드를 분리해둔 이유가 값 파싱 없이
+                    # 로그에서 구분하게 하기 위함이다.
                     outcome = "denied"
                     security_reason_code = exc.reason_code
                     logger.warning(
@@ -372,21 +305,18 @@ def make_tool_guard(
                     )
                     raise
                 except (ToolError, ResourceError, MCPError) as exc:
-                    # Deliberate, already client-safe (SDK contract) —
-                    # audited, then passed through unchanged so a
-                    # downstream tool's own message still reaches the
-                    # model verbatim.
+                    # 의도적으로 던진, 이미 client-safe한 예외(SDK 계약) —
+                    # 감사만 남기고 그대로 통과시켜 하위 tool의 메시지가
+                    # 모델에 그대로 도달하게 한다.
                     outcome = "error"
                     error_kind = type(exc).__name__
                     logger.info("Tool %r failed with a deliberate %s: %s", tool, error_kind, exc)
                     raise
                 except Exception as exc:
-                    # EDGE-009 / AC-004-4: unanticipated crash. Traceback to
-                    # the server log only; the client gets a generic,
-                    # request-id-bearing message with no trace of the
-                    # original exception's text (it may name an internal
-                    # path, a query string, or other server-internal
-                    # detail this module has no way to vet).
+                    # EDGE-009 / AC-004-4: 예기치 않은 크래시. 트레이스백은
+                    # 서버 로그에만 남기고, 클라이언트엔 원본 예외 텍스트
+                    # 없이(내부 경로·쿼리 문자열 등이 섞여 있을 수 있어
+                    # 검증 불가) request_id가 포함된 일반 메시지만 전달.
                     outcome = "error"
                     error_kind = type(exc).__name__
                     logger.exception("Tool %r crashed", tool)
@@ -412,44 +342,43 @@ def make_tool_guard(
 
 
 def _extract_str_arg(arguments: Mapping[str, Any], name: str | None) -> str | None:
-    """Read the tool's designated repo argument (see module docstring: named, never inferred).
+    """tool이 지정한 repo 인자를 읽는다(이름으로만 받음 — 모듈 docstring 참고).
 
-    Three distinct outcomes, deliberately not collapsed (TASK-045):
+    의도적으로 분리한 세 가지 결과(TASK-045):
 
-    - ``name is None`` — the tool declared no repo argument, so there is no
-      repository to authorize. ``None`` here means "skip the repo check",
-      which is correct.
-    - the argument is a ``str`` — returned as-is for ``authorize()`` to check
-      against ``CTR-008``.
-    - the argument is present but **not** a ``str`` — returns
-      ``_MALFORMED_REPO_SENTINEL`` so the repo check still runs and denies,
-      instead of ``None``, which would have skipped it (fail-open).
+    - ``name is None`` — tool에 repo 인자가 없음, ``None``은 "repo 체크
+      스킵"이라는 올바른 의미.
+    - ``str``인 인자 — ``authorize()``가 ``CTR-008``로 검사하도록 그대로
+      반환.
+    - 인자는 있지만 ``str``이 **아님** — ``None``(스킵, fail-open)이 아니라
+      ``_MALFORMED_REPO_SENTINEL``을 반환해 repo 체크가 실행되고 거부되게
+      한다.
     """
     if name is None:
         return None
     if name not in arguments:
-        # The tool names a repo argument but this call did not bind one at
-        # all; there is nothing to check against the allowlist. Distinct
-        # from "bound to a non-string", which is a malformed call.
+        # tool엔 repo 인자가 있지만 이 호출에서 바인딩되지 않음 —
+        # allowlist와 대조할 게 없다. "non-string에 바인딩됨"(잘못된
+        # 호출)과는 다른 경우.
         return None
     value = arguments[name]
     if isinstance(value, str):
         return value
     if value is None:
-        # An explicitly optional repo argument left unset — same meaning as
-        # not bound (``bind_partial().apply_defaults()`` binds omitted
-        # parameters to ``None``).
+        # 명시적으로 optional인 repo 인자가 비어 있음 — 바인딩 안 된 것과
+        # 같은 의미(``bind_partial().apply_defaults()``는 생략된
+        # 파라미터를 ``None``에 바인딩한다).
         return None
     return _MALFORMED_REPO_SENTINEL
 
 
 def _build_args_summary(arguments: Mapping[str, Any], names: tuple[str, ...]) -> dict[str, str]:
-    """CTR-003 ``args_summary``: only the explicitly named arguments, stringified.
+    """CTR-003 ``args_summary``: 명시적으로 지정한 인자만 문자열화한다.
 
-    A parameter left at its default (e.g. an omitted ``ref``) is bound to
-    ``None`` by ``bind_partial().apply_defaults()``; such values are left
-    out of the summary entirely rather than serialized as the literal
-    string ``"None"``.
+    기본값으로 남은 파라미터(예: 생략된 ``ref``)는
+    ``bind_partial().apply_defaults()``에 의해 ``None``으로 바인딩되는데,
+    이런 값은 문자열 ``"None"``으로 직렬화하지 않고 summary에서 아예
+    뺀다.
     """
     summary: dict[str, str] = {}
     for name in names:

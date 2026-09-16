@@ -1,75 +1,49 @@
-"""Audit record serialization and emission (DSN-003, CTR-003).
+"""감사 레코드 직렬화·기록(DSN-003, CTR-003).
 
-Pure serialize-and-write module — the "independent emit unit" DSN-003 calls
-for. It does not construct ``AuditRecord`` values (no clock, no
-``request_id`` generation, no duration measurement) and does not depend on
-the MCP SDK at all; the caller (``tools/guard.py``, TASK-007) assembles a
-complete ``AuditRecord`` for every outcome — ``ok``, ``denied`` (AC-004-2),
-and ``error`` (AC-004-4) — and hands it to ``emit`` here. Because
-``AuditRecord`` already models all three outcomes (``outcome`` +
-``reason_code`` + ``error_kind``), a single ``emit(record)`` call is the
-whole interface — there is no separate "emit a denial" or "emit an error"
-function to keep in sync with this one.
+순수 serialize-and-write 모듈(DSN-003이 말하는 "독립 emit 유닛") —
+`AuditRecord`를 직접 만들지 않는다(시계·request_id 생성·소요시간 측정
+없음, MCP SDK 비의존). 호출부(`tools/guard.py`, TASK-007)가 `ok`/
+`denied`(AC-004-2)/`error`(AC-004-4) 세 결과 모두에 대해 완성된
+`AuditRecord`를 조립해 `emit`에 넘긴다. `AuditRecord`가 `outcome` +
+`reason_code` + `error_kind`로 세 결과를 이미 모델링하므로 `emit(record)`
+하나가 전체 인터페이스다.
 
-Why stdout is safe here (and might not be elsewhere)
--------------------------------------------------------
-For a stdio-transport MCP server, writing anything to stdout is fatal:
-stdout *is* the JSON-RPC transport, and one stray line corrupts the frame.
-This server is deployed over Streamable HTTP only (FRD §7) — stdout carries
-no protocol traffic there, so an ECS log driver can collect it line by line
-as intended (the SDK's own docs note that HTTP-based servers can log to
-stdout safely). **If someone runs this server over stdio instead** (e.g. for
-local debugging against an stdio-only client), every audit line emitted
-here will corrupt that transport. The stream is injectable specifically so
-an operator in that situation can redirect audit output elsewhere — this
-module does not assume Streamable HTTP, only its caller's deployment does.
+**stdout이 안전한 이유(다른 곳에선 아닐 수 있음)**: 이 서버는 Streamable
+HTTP 전용 배포(FRD §7)라 stdout에 프로토콜 트래픽이 없어 ECS 로그
+드라이버가 줄 단위로 수집한다(SDK 공식 문서도 HTTP 서버의 stdout 로깅은
+안전하다고 명시). **stdio transport로 이 서버를 돌리면**(로컬 디버깅 등)
+여기서 쓰는 모든 감사 줄이 그 전송(JSON-RPC 프레임)을 깨뜨린다 — 그래서
+`stream`을 주입 가능하게 열어뒀다.
 
-Why not ``print()``
---------------------
-``print()`` always targets the current ``sys.stdout`` with no way to inject
-a substitute, which breaks (a) tests, which need to capture output without
-mutating global state, and (b) the stdio-safety escape hatch above. ``emit``
-takes an explicit, defaulted-to-``None`` stream parameter instead, resolved
-against ``sys.stdout`` at call time — not at function-definition time — so
-a caller that reassigns ``sys.stdout`` later still gets the current stream,
-which a literal ``stream: AuditStream = sys.stdout`` default would not
-(defaults bind once, at import).
+**`print()` 대신인 이유**: `print()`는 항상 현재 `sys.stdout`을 대상으로
+하고 교체할 방법이 없어, 테스트(전역 상태를 건드리지 않고 출력을 캡처해야
+함)와 위 stdio 회피 경로 둘 다 깨뜨린다. `emit`은 기본값 `None`인 `stream`
+파라미터를 받아 **호출 시점**(정의 시점이 아니라)에 `sys.stdout`으로
+해석한다 — 리터럴 기본값 `stream: AuditStream = sys.stdout`은 import
+시점에 한 번만 바인딩되어 이후 `sys.stdout` 재할당을 반영하지 못한다.
 
-Flushing
---------
-Every record is flushed immediately after being written. Tool calls are
-network-bound (GitHub REST, GitHub App token exchange), not a tight loop, so
-one extra flush per call is not a hot-path cost — but a buffered line lost
-when the container is SIGKILLed after an unflushed SIGTERM grace period is a
-missing audit record, i.e. a compliance gap, not just a UX rough edge.
+**플러시**: 매 레코드를 쓴 직후 flush한다. tool 호출은 네트워크 바운드
+(GitHub REST, 토큰 교환)라 호출당 flush 1회는 핫패스 비용이 아니다 —
+반면 SIGTERM 유예 후 SIGKILL로 버퍼링된 줄이 유실되면 단순 UX 문제가
+아니라 감사 레코드 누락, 즉 컴플라이언스 공백이다.
 
-Masking (AC-004-3) — two layers, do not conflate them
---------------------------------------------------------
-1. **Structural** (already holds by construction, nothing to implement
-   here): ``AuditRecord`` has no field for a bearer token, a private key, or
-   file contents. ``args_summary`` is documented as identifying arguments
-   only — repo, path, ref, query (see ``types.AuditRecord``).
-2. **Runtime** (implemented here, in ``_redact``): a defensive backstop for
-   a caller that puts something it should not have into ``args_summary``
-   anyway — a length cap, plus pattern-based redaction of the secret shapes
-   the FRD names explicitly (a PEM header, an ``Authorization: Bearer``
-   value, and the four documented GitHub token prefixes). This is
-   deliberately narrow: it defends known, cheap-to-detect secret shapes, not
-   general PII or every conceivable leak — a caller that routes file
-   contents through ``args_summary`` is still violating the contract; this
-   backstop only limits the blast radius (truncated, not fully suppressed).
+**마스킹(AC-004-3), 두 계층을 섞지 말 것**:
+1. **구조적**(이미 성립, 구현 불필요) — `AuditRecord`엔 애초 bearer
+   토큰·private key·파일 내용을 담을 필드가 없다. `args_summary`는
+   식별용 인자(repo, path, ref, query)만 문서화됨(`types.AuditRecord`
+   참고).
+2. **런타임**(`_redact`에서 구현) — `args_summary`에 실수로 민감값이
+   들어온 경우를 위한 방어 백스톱: 길이 상한과, FRD가 명시한 시크릿
+   형태(PEM 헤더, `Authorization: Bearer` 값, GitHub 토큰 4개 접두사)
+   패턴 리댁션. 일반 PII나 모든 누출을 막는 게 아니라, 알려져 있고
+   저비용으로 탐지 가능한 시크릿 형태만 방어하는 의도적으로 좁은 범위다.
 
-Single-line guarantee (AC-004-1)
-----------------------------------
-``json.dumps`` with its default settings (``ensure_ascii=True``, no
-``indent``) escapes every control character in a string value — including a
-raw ``\\n`` or ``\\r`` — as a two-character sequence or a ``\\u00XX`` escape,
-and never emits a literal newline itself outside of an explicit ``indent``.
-That is what makes "one record = one line" hold even when ``args_summary``
-(or, in principle, any other field) carries embedded newlines or control
-characters: the escaping is a property of the JSON encoder, not of the
-masking above, so it protects every field in the record, not only the ones
-``_redact`` touches.
+**한 줄 보장(AC-004-1)**: `json.dumps` 기본 설정(`ensure_ascii=True`,
+`indent` 없음)은 문자열 값 안의 모든 제어문자(`\\n`/`\\r` 포함)를
+이스케이프하고 리터럴 개행을 만들지 않는다 — 그래서 `args_summary`(또는
+다른 필드)에 개행이 섞여도 "레코드 1개 = 줄 1개"가 유지된다. 이건 JSON
+인코더 자체의 속성이라 `_redact`가 손대지 않는 필드에도 동일하게
+적용된다.
 """
 
 import json
@@ -79,19 +53,17 @@ from typing import Final, Protocol
 
 from devoks_mcp_management.types import AuditRecord
 
-#: Runtime redaction cap (AC-004-3). Generous enough for legitimate
-#: identifying values (a deep repo path, a long search query) while far
-#: smaller than any file content a caller might mistakenly pass through.
-#: Public (unlike the other masking internals below) so boundary tests can
-#: reference it directly instead of duplicating the number.
+#: 런타임 리댁션 상한(AC-004-3). 정상적인 식별값(긴 repo 경로, 긴 검색어)은
+#: 넉넉히 담으면서 캡처될 만한 파일 내용보다는 훨씬 작다. 다른 마스킹 내부
+#: 요소와 달리 public — 경계 테스트가 숫자를 중복 정의하지 않고 직접
+#: 참조하도록.
 MAX_ARG_VALUE_CHARS: Final = 500
 _TRUNCATION_SUFFIX: Final = "...<truncated>"
 
-#: Secret shapes named explicitly by the FRD (AC-004-3): a PEM header, a
-#: Bearer credential, and the four documented GitHub token prefixes.
-#: Case-insensitive on purpose — over-redacting a value that merely looks
-#: like a secret is the safe direction; under-redacting an actual one is
-#: not (mirrors the fail-safe stance ``auth.policy`` takes elsewhere).
+#: FRD가 명시적으로 지목한 시크릿 형태(AC-004-3): PEM 헤더, Bearer
+#: 자격증명, GitHub 토큰 4개 접두사. 대소문자 무시는 의도적 — 시크릿처럼
+#: 보이기만 하는 값을 과잉 리댁션하는 쪽이 안전한 방향이고, 실제 시크릿을
+#: 놓치는 쪽은 아니다(다른 곳의 `auth.policy`와 같은 fail-safe 태도).
 _SECRET_PATTERN: Final = re.compile(
     r"-----BEGIN"
     r"|Bearer\s+\S+"
@@ -106,12 +78,11 @@ __all__ = ["MAX_ARG_VALUE_CHARS", "AuditStream", "emit", "to_json_line"]
 
 
 class AuditStream(Protocol):
-    """The minimal stream capability ``emit`` needs.
+    """`emit`에 필요한 최소한의 스트림 기능.
 
-    Deliberately narrower than ``typing.TextIO`` — ``emit`` only ever writes
-    and flushes, so a structural ``Protocol`` lets ``sys.stdout``, an
-    ``io.StringIO`` in tests, or any other write+flush sink satisfy it
-    without subclassing anything.
+    `typing.TextIO`보다 의도적으로 좁다 — `emit`은 write/flush만 쓰므로,
+    구조적 `Protocol`이면 `sys.stdout`이나 테스트용 `io.StringIO` 등 어떤
+    write+flush sink든 상속 없이 만족시킬 수 있다.
     """
 
     def write(self, s: str, /) -> object: ...
@@ -119,11 +90,11 @@ class AuditStream(Protocol):
 
 
 def to_json_line(record: AuditRecord) -> str:
-    """Serialize ``record`` to one CTR-003 JSON line (no trailing newline).
+    """`record`를 CTR-003 JSON 한 줄로 직렬화한다(끝에 개행 없음).
 
-    Pure — no I/O — so serialization and masking can be tested directly,
-    without a stream to capture. Field names match CTR-003 exactly; do not
-    rename these keys, operators query CloudWatch Logs Insights by them.
+    순수 함수(I/O 없음) — 스트림을 캡처하지 않고도 직렬화·마스킹을 직접
+    테스트할 수 있다. 필드명은 CTR-003과 정확히 일치 — 운영자가
+    CloudWatch Logs Insights에서 이 키로 조회하므로 이름을 바꾸지 않는다.
     """
     payload: dict[str, object] = {
         "ts": record.ts,
@@ -142,13 +113,11 @@ def to_json_line(record: AuditRecord) -> str:
 
 
 def emit(record: AuditRecord, *, stream: AuditStream | None = None) -> None:
-    """Write one audit line for ``record`` and flush it.
+    """`record`의 감사 줄 하나를 쓰고 flush한다.
 
-    ``stream`` defaults to the caller's current ``sys.stdout`` (see module
-    docstring for why the resolution happens here, at call time). The line
-    and its trailing newline are written in a single ``write`` call so
-    nothing else sharing the stream can interleave a partial line between
-    them.
+    `stream` 기본값은 호출 시점의 `sys.stdout`(이유는 모듈 docstring
+    참고). 줄과 끝 개행을 `write` 한 번에 써서, 스트림을 공유하는 다른
+    코드가 그 사이에 부분 줄을 끼워넣을 수 없게 한다.
     """
     out: AuditStream = sys.stdout if stream is None else stream
     out.write(to_json_line(record) + "\n")
@@ -156,11 +125,11 @@ def emit(record: AuditRecord, *, stream: AuditStream | None = None) -> None:
 
 
 def _redact(value: str) -> str:
-    """Runtime backstop for a value that should not have reached here (AC-004-3).
+    """여기까지 오면 안 됐을 값을 위한 런타임 백스톱(AC-004-3).
 
-    Checked against the *full*, untruncated value first, so a secret
-    pattern positioned past ``MAX_ARG_VALUE_CHARS`` is still caught —
-    truncating first could let it survive past the cut boundary undetected.
+    절단 전 **전체** 원문 값을 먼저 패턴 검사한다 — 먼저 잘라내면
+    `MAX_ARG_VALUE_CHARS` 너머에 있는 시크릿 패턴이 탐지되지 않은 채
+    살아남을 수 있다.
     """
     if _SECRET_PATTERN.search(value):
         return _REDACTED

@@ -1,31 +1,22 @@
-"""Environment variables -> immutable, role-scoped ``Settings`` (DSN-SB-005).
+"""환경변수 -> 불변, 역할별 ``Settings`` (DSN-SB-005).
 
-This module deliberately duplicates the Fail-Fast pattern from
-``servers/management/src/devoks_mcp_management/config.py`` (all problems
-collected and raised together in one ``ConfigError``, DSN-006) rather than
-importing it from a shared package — FRD §4.4 rejects a shared config
-package because it would couple the two servers' deployments.
+``servers/management``의 config.py와 동일한 Fail-Fast 패턴(에러를 모두 모아 한 번에
+``ConfigError``로 raise, DSN-006)을 공유 패키지로 추출하지 않고 의도적으로 중복한다 —
+FRD §4.4가 두 서버의 배포 독립성을 위해 공용 config 패키지를 금지한다.
 
-**Why two entry points instead of one ``load_settings(env, role)``:**
-One image serves two Lambdas (FRD §4.4) with genuinely different required
-keys (FRD §5.2) — handler needs ``WORKER_FUNCTION_NAME`` but never
-``ANTHROPIC_API_KEY``; worker is the reverse. Splitting into
-``load_handler_settings``/``load_worker_settings`` (and ``HandlerSettings``/
-``WorkerSettings``) makes it a type error, not just a runtime omission, for
-handler code to reach for a worker-only field. Loading the wrong role's
-settings for a Lambda that doesn't need them would also cost handler's
-3-second/4 KB env budget (``EDGE-021``) for keys it never uses.
+**``load_settings(env, role)`` 하나가 아니라 진입점을 둘로 나눈 이유:** 이미지 하나가
+Lambda 두 개(FRD §4.4)를 서빙하는데 필수 키가 역할마다 다르다(FRD §5.2) — handler는
+``WORKER_FUNCTION_NAME``이 필요하고 ``ANTHROPIC_API_KEY``는 필요 없다(worker는 반대).
+``load_handler_settings``/``load_worker_settings``(``HandlerSettings``/``WorkerSettings``)로
+분리하면 잘못된 역할의 필드 접근이 런타임 누락이 아니라 타입 에러로 즉시 드러난다.
 
-**``IDEMPOTENCY_TABLE`` is common, not handler-only (2026-09-14, ``TASK-014``
-correction).** FRD §5.2's environment-key table originally scoped this key to
-handler alone. ``TASK-014`` (``worker.py``) found this incomplete: ``EDGE-SB-005``
-requires the *worker* to also check/record completion against the same
-DynamoDB table (Lambda's own async-invoke retry is a worker-visible
-duplication cause handler cannot see at all), and ``EDGE-SB-015``'s in-flight
-coalescing lock (``idempotency.claim_inflight_query``/``release_inflight_query``)
-reuses that identical table under its own key prefix. Both roles now require
-it — the same kind of FRD gap ``TASK-012`` already closed once for
-``WORKER_FUNCTION_NAME`` (see ``_HANDLER_REQUIRED_KEYS`` below).
+**``IDEMPOTENCY_TABLE``은 handler 전용이 아니라 공통이다(2026-09-14, ``TASK-014`` 수정).**
+FRD §5.2 원문은 이 키를 handler 전용으로 뒀지만, ``TASK-014``(worker.py)에서 worker도
+같은 DynamoDB 테이블로 완료 여부를 확인/기록해야 함(``EDGE-SB-005`` — Lambda 자체의
+async-invoke 재시도는 handler가 볼 수 없는 worker 전용 중복 원인)과 in-flight coalescing
+락(``EDGE-SB-015``)이 같은 테이블을 키 prefix만 다르게 재사용한다는 게 드러나 두 역할
+모두 필수로 바뀌었다 — ``WORKER_FUNCTION_NAME``에서 ``TASK-012``가 이미 겪은 것과 같은
+FRD 누락 패턴(아래 ``_HANDLER_REQUIRED_KEYS`` 참고).
 """
 
 from __future__ import annotations
@@ -36,11 +27,9 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from urllib.parse import urlsplit
 
-# CTR-SB-004: the Claude API call contract's fixed values. FRD §5.2's
-# environment-key table has no entries for these three — AC-SB-005-5 requires
-# that user input can never change them, so they are code constants rather
-# than env-overridable settings. ``ask.py`` (TASK-011) imports these directly;
-# there is no env var that reaches them, by construction.
+# CTR-SB-004: Claude API 호출 계약의 고정값. AC-SB-005-5가 사용자 입력으로 절대 바뀌지
+# 않아야 한다고 요구하므로 env로 오버라이드 가능한 설정이 아니라 코드 상수로 둔다.
+# ask.py(TASK-011)가 직접 import한다 — 이 값에 닿는 env var는 없다.
 CLAUDE_MODEL = "claude-opus-5"
 CLAUDE_MAX_TOKENS = 8000
 CLAUDE_EFFORT = "medium"
@@ -57,10 +46,8 @@ IDEMPOTENCY_TTL_SECONDS_MAX = 86400
 _DEFAULT_LOG_LEVEL = "INFO"
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
-#: FRD §5.2 keys with no handler-only/worker-only annotation, plus
-#: ``IDEMPOTENCY_TABLE`` (moved here by TASK-014 -- see module docstring's
-#: "IDEMPOTENCY_TABLE is common, not handler-only" section). Required by
-#: both roles.
+#: FRD §5.2에서 역할 구분 없는 키 + ``IDEMPOTENCY_TABLE``(TASK-014, 모듈 docstring
+#: "IDEMPOTENCY_TABLE is common" 절 참고). 두 역할 모두 필수.
 _COMMON_REQUIRED_KEYS: tuple[str, ...] = (
     "SLACK_SIGNING_SECRET",
     "SLACK_BOT_TOKEN",
@@ -68,14 +55,10 @@ _COMMON_REQUIRED_KEYS: tuple[str, ...] = (
     "IDEMPOTENCY_TABLE",
 )
 
-#: FRD §5.2's environment-key table does not list a key for the worker
-#: Lambda's identifier -- an unavoidable gap TASK-012 (handler.py) fills:
-#: DSN-SB-001 splits handler/worker into two Lambdas specifically so the
-#: handler can hand off work async and return within CTR-SB-002's 3-second
-#: budget, and AC-SB-002-1 requires that handoff to actually happen (a
-#: ``boto3`` Lambda ``Invoke``), which needs the worker's ``FunctionName``
-#: from somewhere. Handler-only -- worker never invokes itself, so it never
-#: needs this key.
+#: FRD §5.2에 없던 키지만, AC-SB-002-1(``boto3`` Lambda ``Invoke``로 비동기 handoff)이
+#: worker의 ``FunctionName``을 필요로 해 TASK-012(handler.py)가 추가(DSN-SB-001: handler가
+#: CTR-SB-002의 3초 budget 안에서 비동기로 넘기도록 두 Lambda로 분리). handler 전용 —
+#: worker는 자기 자신을 invoke하지 않는다.
 _HANDLER_REQUIRED_KEYS: tuple[str, ...] = ("WORKER_FUNCTION_NAME",)
 
 _WORKER_REQUIRED_KEYS: tuple[str, ...] = (
@@ -86,22 +69,19 @@ _WORKER_REQUIRED_KEYS: tuple[str, ...] = (
 
 
 class ConfigError(Exception):
-    """One or more environment values failed validation at startup.
-
-    The message lists every problem found in this call, not just the first.
-    """
+    """시작 시 환경변수 검증 실패 — 메시지에 이번 호출에서 발견된 문제를 전부 모아 담는다."""
 
 
 class _FieldError(Exception):
-    """Internal control flow only: carries one field's user-facing message."""
+    """내부 제어 흐름 전용 — 필드 하나의 사용자용 에러 메시지를 담아 전달한다."""
 
 
 @dataclass(frozen=True, slots=True)
 class HandlerSettings:
-    """Validated configuration for the ``slack-handler`` Lambda entry point.
+    """``slack-handler`` Lambda 진입점의 검증된 설정.
 
-    ``signing_secret``/``bot_token`` are excluded from ``repr`` so logging or
-    raising a ``HandlerSettings`` instance can never leak a credential.
+    ``signing_secret``/``bot_token``은 ``repr`` 제외 — 로그나 예외 출력으로 자격증명이
+    새는 걸 막는다.
     """
 
     signing_secret: str = field(repr=False)
@@ -116,11 +96,11 @@ class HandlerSettings:
 
 @dataclass(frozen=True, slots=True)
 class WorkerSettings:
-    """Validated configuration for the ``slack-worker`` Lambda entry point.
+    """``slack-worker`` Lambda 진입점의 검증된 설정.
 
-    ``signing_secret``/``bot_token``/``anthropic_api_key``/``user_token_map``
-    are excluded from ``repr`` — ``user_token_map`` values are MCP bearer
-    tokens (CTR-SB-006), a credential exactly like the other three.
+    ``signing_secret``/``bot_token``/``anthropic_api_key``/``user_token_map``는
+    ``repr`` 제외 — ``user_token_map``의 값도 MCP bearer 토큰(CTR-SB-006)이라 나머지
+    셋과 동일한 자격증명이다.
     """
 
     signing_secret: str = field(repr=False)
@@ -136,11 +116,10 @@ class WorkerSettings:
 
 
 def load_handler_settings(env: Mapping[str, str]) -> HandlerSettings:
-    """Parse and validate ``env`` into a ``HandlerSettings``.
+    """``env``를 파싱/검증해 ``HandlerSettings``로 변환.
 
-    Raises ``ConfigError`` if any required key (common or handler-only) is
-    missing, or any value fails format/range validation. All problems are
-    collected before raising (DSN-006).
+    필수 키(공통 또는 handler 전용) 누락, 형식/범위 오류 시 ``ConfigError`` — 모든 문제를
+    모아 한 번에 던진다(DSN-006).
     """
     errors: list[str] = []
 
@@ -201,11 +180,10 @@ def load_handler_settings(env: Mapping[str, str]) -> HandlerSettings:
 
 
 def load_worker_settings(env: Mapping[str, str]) -> WorkerSettings:
-    """Parse and validate ``env`` into a ``WorkerSettings``.
+    """``env``를 파싱/검증해 ``WorkerSettings``로 변환.
 
-    Raises ``ConfigError`` if any required key (common or worker-only) is
-    missing, or any value fails format/range/schema validation. All problems
-    are collected before raising (DSN-006).
+    필수 키(공통 또는 worker 전용) 누락, 형식/범위/스키마 오류 시 ``ConfigError`` — 모든
+    문제를 모아 한 번에 던진다(DSN-006).
     """
     errors: list[str] = []
 
@@ -293,9 +271,8 @@ def _load_json_object(raw: str, key: str) -> dict[str, Any]:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
-        # str(exc) is line/column/char position only, never the input text —
-        # safe even though this key's value is a JSON object of credentials
-        # (CTR-SB-006).
+        # str(exc)는 위치 정보만 담고 원문은 포함하지 않음 — 이 키의 값이 자격증명
+        # JSON(CTR-SB-006)이라도 안전.
         raise _FieldError(f"{key} is not valid JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise _FieldError(f"{key} must be a JSON object")
@@ -307,9 +284,8 @@ def _parse_user_token_map(raw: str) -> Mapping[str, str]:
 
     mapping: dict[str, str] = {}
     problems: list[str] = []
-    # Entries are identified by ordinal position, never by echoing the Slack
-    # user ID or the MCP token — the value here *is* a bearer credential
-    # (CTR-SB-006), and this error can reach a log.
+    # 항목은 순번으로만 식별 — Slack user ID나 MCP 토큰을 echo하지 않는다(CTR-SB-006,
+    # 이 에러가 로그로 흘러갈 수 있음).
     for index, (slack_user_id, token) in enumerate(data.items(), start=1):
         if not slack_user_id:
             problems.append(f"SLACK_USER_TOKEN_MAP entry #{index}: key must be a non-empty string")

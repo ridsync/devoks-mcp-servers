@@ -1,41 +1,23 @@
-"""Composition root: build an ``MCPServer`` wired for auth, RBAC, and audit (TASK-008).
+"""Composition root: 인증·RBAC·감사를 연결한 ``MCPServer``를 만든다 (TASK-008).
 
-``create_server(settings) -> MCPServer`` is a **factory**, not a module-level
-singleton. Nothing at module scope constructs an ``MCPServer`` or reads
-``Settings`` — a server built at import time would need a fully-populated
-environment just to import this module, which would make it impossible for
-a test to build several servers from several ``Settings`` in one process,
-and would turn "import this module" into an operation that can raise
-``ConfigError``.
+``create_server(settings) -> MCPServer``는 **팩토리**다 — 모듈 스코프에 인스턴스를
+두지 않아, import만으로 환경변수를 읽거나 ``ConfigError``가 나는 일이 없다.
 
-``token_verifier=`` and ``auth=AuthSettings(...)`` are always constructed and
-passed together (FRD §7 constraint): reading
-``mcp.server.mcpserver.server.MCPServer.__init__`` in the installed
-``mcp==2.1.1`` package confirms it raises ``ValueError`` at construction time
-— before any request is served — if ``auth`` is given without a verifier, or
-a verifier is given without ``auth``. There is no code path here that could
-supply one without the other, so that failure mode is structurally
-unreachable rather than merely tested against.
+``token_verifier=``와 ``auth=AuthSettings(...)``는 항상 함께 넘긴다(FRD §7). 설치된
+``mcp==2.1.1`` 소스 확인 — 둘 중 하나만 주면 생성 시점에 ``ValueError``. 이 모듈엔
+둘을 따로 줄 경로가 없어 구조적으로 발생 불가능하다.
 
-``app.py`` (TASK-009) is the next composition layer up — it takes the
-``MCPServer`` this factory returns and mounts it into a Starlette app
-alongside ``/healthz`` and ``transport_security``. Nothing ASGI-related
-belongs in this module.
+다음 조립 계층은 ``app.py``(TASK-009) — 여기서 만든 ``MCPServer``를 Starlette 앱에
+마운트한다. ASGI 관련 코드는 이 모듈에 두지 않는다.
 
-``lifespan=`` (TASK-023, DSN-004) — the *MCP protocol* lifespan, not ASGI
-------------------------------------------------------------------------
-``create_server`` accepts an optional ``lifespan=`` and forwards it verbatim
-into ``MCPServer(...)``. This module never builds one itself and never
-imports anything from ``adapters/*`` — building the GitHub credential
-provider/HTTP client needs an ``httpx2.AsyncClient`` whose lifetime and
-cleanup ``app.py`` owns (see that module's docstring), and this module's own
-job (§7 auth wiring, RBAC guard, tool registration) has nothing to do with
-that. Two overloads keep every existing call site (``create_server(settings)``
-with no ``lifespan``) typed exactly as before, ``MCPServer[None]`` — the
-generic parameter only changes to whatever type a caller's ``lifespan``
-yields once one is actually supplied. See
-<https://py.sdk.modelcontextprotocol.io/handlers/lifespan/index.md> for the
-``lifespan=`` contract this mirrors.
+``lifespan=`` (TASK-023, DSN-004) — ASGI가 아니라 *MCP 프로토콜* lifespan
+--------------------------------------------------------------------------
+``lifespan=``은 ``MCPServer(...)``로 그대로 전달만 한다. 이 모듈은 직접 만들지도
+``adapters/*``를 import하지도 않는다 — GitHub 자격증명/HTTP 클라이언트 수명은
+``app.py``가 소유하며, 이 모듈의 책임(§7 인증·RBAC guard·툴 등록)과는 무관하다.
+오버로드 2개로 기존 호출부(``lifespan`` 미지정)의 타입 ``MCPServer[None]``을
+그대로 유지한다. 계약 근거:
+<https://py.sdk.modelcontextprotocol.io/handlers/lifespan/index.md>.
 """
 
 from __future__ import annotations
@@ -52,17 +34,14 @@ from devoks_mcp_management.config import Settings
 from devoks_mcp_management.tools.guard import make_tool_guard
 from devoks_mcp_management.tools.registry import Guard, register_tools
 
-#: CTR-002 / FRD §5.1 fixes this exact scope list for Stage 1 ("required_scopes
-#: 는 [\"devoks:read\"]"). Kept as a module constant rather than sourced from
-#: ``Settings``: it is part of the CTR-002 contract itself, not a
-#: per-deployment knob — letting an operator override it via the environment
-#: would silently change what AC-002-5/EDGE-010 mean without a spec change.
+#: CTR-002 / FRD §5.1이 Stage 1의 scope를 ``["devoks:read"]``로 고정. ``Settings``가
+#: 아니라 모듈 상수로 둔 이유 — 배포별 옵션이 아니라 계약 자체이기 때문. 환경변수로
+#: 오버라이드 가능하게 하면 스펙 변경 없이 AC-002-5/EDGE-010의 의미가 조용히 바뀐다.
 REQUIRED_SCOPES: Final[list[str]] = ["devoks:read"]
 
-#: Name advertised to MCP clients (``MCPServer.name`` / the low-level
-#: ``Server``'s ``name``). Not derived from ``Settings`` — the server's
-#: identity on the wire is a code-level constant, distinct from
-#: deployment-level config like ``public_url``.
+#: MCP 클라이언트에 노출되는 서버 이름(``MCPServer.name``). ``Settings``에서
+#: 끌어오지 않음 — 와이어상 서버 정체성은 ``public_url`` 같은 배포 설정과 달리
+#: 코드 레벨 상수다.
 SERVER_NAME: Final = "devoks-management-mcp"
 
 
@@ -70,13 +49,11 @@ SERVER_NAME: Final = "devoks-management-mcp"
 def create_server(settings: Settings) -> MCPServer[None]: ...
 
 
-#: ``[LifespanResultT]`` (PEP 695 syntax, this project's Python 3.14 floor) is
-#: the MCP-protocol lifespan's yielded context type — solved per call site
-#: from whatever ``lifespan=`` a caller supplies (e.g. ``app.py``'s
-#: ``GitHubLifespanContext``). Omitting ``lifespan=`` entirely resolves
-#: through the overload above to ``None`` instead, matching the SDK's own
-#: default lifespan (``mcp.server.lowlevel.server.lifespan``), which yields
-#: nothing.
+#: ``[LifespanResultT]``(PEP 695, 이 프로젝트의 Python 3.14 하한)는 MCP 프로토콜
+#: lifespan이 yield하는 컨텍스트 타입 — 호출부가 넘긴 ``lifespan=``에 따라 호출별로
+#: 해석된다(예: ``app.py``의 ``GitHubLifespanContext``). ``lifespan=``을 생략하면
+#: 위 오버로드로 ``None``이 되어 SDK 기본 lifespan(``mcp.server.lowlevel.server.lifespan``,
+#: 아무것도 yield하지 않음)과 일치한다.
 @overload
 def create_server[LifespanResultT](
     settings: Settings,
@@ -90,51 +67,38 @@ def create_server(
     *,
     lifespan: Callable[[MCPServer[Any]], AbstractAsyncContextManager[Any]] | None = None,
 ) -> MCPServer[Any]:
-    """Build one ``MCPServer`` instance from ``settings``.
+    """``settings``로부터 ``MCPServer`` 인스턴스 하나를 만든다.
 
-    - ``lifespan``: forwarded to ``MCPServer(..., lifespan=...)`` unchanged
-      (TASK-023, DSN-004) — see the module docstring for why this module
-      never constructs one itself. Omitting it (the first overload) yields
-      ``MCPServer[None]``, matching the SDK's own default MCP-protocol
-      lifespan.
-    - ``token_verifier``: ``StaticTableTokenVerifier`` bound to
-      ``settings.client_tokens`` (DSN-001) — resolves a Bearer token to an
-      ``AccessToken`` for every request the SDK's own auth middleware admits.
-    - ``auth``: ``AuthSettings`` whose ``resource_server_url``/``issuer_url``
-      mirror ``settings.public_url``/``settings.issuer_url`` (AC-002-4's
-      premise — the RFC 9728 metadata document's ``resource`` must match the
-      configured public URL exactly) and whose ``required_scopes`` is the
-      CTR-002 scope list above (AC-002-5, EDGE-010).
+    - ``lifespan``: ``MCPServer(..., lifespan=...)``로 그대로 전달(TASK-023,
+      DSN-004) — 생략 시 첫 오버로드에 의해 ``MCPServer[None]``이 된다.
+    - ``token_verifier``: ``settings.client_tokens``에 바인딩된
+      ``StaticTableTokenVerifier``(DSN-001) — SDK auth 미들웨어가 통과시킨 모든
+      요청의 Bearer 토큰을 ``AccessToken``으로 해석한다.
+    - ``auth``: ``resource_server_url``/``issuer_url``이 각각
+      ``settings.public_url``/``settings.issuer_url``과 일치(AC-002-4 전제 —
+      RFC 9728 메타데이터의 ``resource``가 설정된 public URL과 정확히 같아야 함)하고,
+      ``required_scopes``는 위 CTR-002 scope 목록(AC-002-5, EDGE-010).
 
-      ``issuer_url``/``resource_server_url`` are passed as the **plain
-      strings** already validated by ``config.load_settings`` — not
-      pre-wrapped in ``pydantic.AnyHttpUrl(...)``. Measured against the
-      installed ``mcp==2.1.1`` (``AuthSettings.model_fields``): its
-      ``model_config = ConfigDict(url_preserve_empty_path=True)`` only takes
-      effect while pydantic validates a **raw string** into the field —
-      handing it an *already-constructed* ``AnyHttpUrl`` (e.g. from
-      pre-wrapping with ``AnyHttpUrl(settings.public_url)``, as an earlier
-      draft of this module did) skips that re-validation and the value keeps
-      whatever normalization ``AnyHttpUrl(...)`` itself already applied,
-      which unconditionally appends a trailing ``/`` to a path-less URL. A
-      path-less ``settings.public_url`` (the common case) would then end up
-      as ``resource_server_url`` with a trailing slash it never had —
-      breaking the exact-match premise of AC-002-4. Passing the strings
-      through lets ``AuthSettings`` validate them itself and preserve the
-      canonical (no trailing slash) form. See the TASK-008 handover notes
-      for the same finding.
-    - A ``tools.guard.make_tool_guard`` instance is built once here from the
-      same ``settings`` and handed to ``tools.registry.register_tools``,
-      which is currently a no-op (DSN-005; no adapters exist yet — see that
-      module's docstring for TASK-022's hook-in point).
+      ``issuer_url``/``resource_server_url``은 ``config.load_settings``가 이미
+      검증한 **순수 문자열 그대로** 넘긴다 — ``pydantic.AnyHttpUrl(...)``로 미리
+      감싸지 않는다. 설치된 ``mcp==2.1.1``(``AuthSettings.model_fields``) 확인:
+      ``url_preserve_empty_path=True`` 설정은 pydantic이 **raw string**을 검증할
+      때만 적용된다. 이미 만들어진 ``AnyHttpUrl``을 넘기면(과거 초안이 그랬음) 이
+      재검증을 건너뛰고 ``AnyHttpUrl(...)``이 이미 적용한 정규화 — path 없는 URL에
+      무조건 trailing ``/`` 추가 — 가 그대로 남는다. 흔한 케이스인 path 없는
+      ``settings.public_url``이 없던 trailing slash를 달고 나와 AC-002-4의 정확
+      일치 전제가 깨진다. 문자열을 그대로 넘기면 ``AuthSettings``가 직접 검증해
+      정규형(trailing slash 없음)을 유지한다.
+    - ``tools.guard.make_tool_guard`` 인스턴스를 같은 ``settings``로 여기서 한 번
+      만들어 ``tools.registry.register_tools``에 넘긴다 — 현재는 no-op(DSN-005,
+      아직 어댑터 없음. TASK-022 hook-in 지점은 그 모듈 docstring 참고).
     """
     token_verifier = StaticTableTokenVerifier.from_settings(settings)
     auth = AuthSettings(
-        # str -> AnyHttpUrl coercion happens at pydantic runtime validation
-        # (see the paragraph above) but pyright's generated `__init__` stub
-        # for `AuthSettings` is typed to the post-coercion field type, so a
-        # plain `str` here is a real, expected mismatch from pyright's point
-        # of view — not a mistake to silently work around differently.
+        # str -> AnyHttpUrl 변환은 pydantic 런타임 검증에서 일어나지만(위 참고),
+        # pyright가 생성한 `AuthSettings.__init__` 스텁은 변환 후 타입으로
+        # 잡혀 있어 여기 `str`을 넘기는 건 pyright 입장에서 정상적인 타입
+        # 불일치다 — 다르게 우회할 실수가 아니다.
         issuer_url=settings.issuer_url,  # pyright: ignore[reportArgumentType]
         resource_server_url=settings.public_url,  # pyright: ignore[reportArgumentType]
         required_scopes=REQUIRED_SCOPES,
@@ -146,12 +110,10 @@ def create_server(
         lifespan=lifespan,
     )
 
-    # `Guard`-typed explicitly: `make_tool_guard`'s own return annotation
-    # (`Callable[..., Callable[[F], F]]`) carries a TypeVar that only gets
-    # solved when a *specific* tool function is decorated — which never
-    # happens in this module — so an explicit annotation is what tells
-    # pyright to treat this value as `Guard` (see registry.py) rather than
-    # report the otherwise-unresolved TypeVar as unknown.
+    # `Guard`로 명시 타입 지정: `make_tool_guard`의 반환 타입
+    # (`Callable[..., Callable[[F], F]]`)에 있는 TypeVar는 실제 툴 함수를
+    # 데코레이트할 때만 풀리는데 이 모듈에선 그 일이 없다 — 명시 타입이 없으면
+    # pyright가 unresolved TypeVar를 unknown으로 보고한다.
     guard: Guard = make_tool_guard(settings)
     register_tools(mcp, guard)
 

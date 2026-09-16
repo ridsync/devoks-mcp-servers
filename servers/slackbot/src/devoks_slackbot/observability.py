@@ -1,102 +1,84 @@
-"""Query observability record — one JSON line per query, no raw question (TASK-008).
+"""쿼리 관측 레코드 -- 쿼리 1건당 JSON 한 줄, 원본 질문은 담지 않음(TASK-008).
 
-``REQ-SB-007``: every Slack query — regardless of outcome — leaves exactly one
-structured line on stdout so an operator can answer "who asked what, when,
-how long did it take, and what did it cost" from CloudWatch Logs Insights
-alone, without a database. ``CTR-SB-008`` (FRD §5.1) is the field-set SSOT;
-the field names/order below must match it exactly — do not rename or
-reorder, operators query by these names.
+``REQ-SB-007``: 모든 Slack 쿼리는 결과와 무관하게 stdout에 구조화된 한 줄을 남겨,
+운영자가 DB 없이 CloudWatch Logs Insights만으로 "누가 뭘 언제 물었고, 얼마나
+걸렸고, 비용이 얼마였는지"에 답할 수 있게 한다. ``CTR-SB-008``(FRD §5.1)이 필드셋
+SSOT다 -- 아래 필드명/순서는 반드시 그대로 맞춰야 한다(운영자가 이 이름으로
+쿼리하므로 rename/reorder 금지).
 
-Why this module builds the record (unlike Stage 1's ``audit/logger.py``)
+이 모듈이 레코드를 직접 조립하는 이유(Stage 1의 ``audit/logger.py``와 다른 점)
 --------------------------------------------------------------------------
-Stage 1's ``DSN-003`` deliberately keeps ``audit/logger.py`` free of any
-record-construction logic (no clock, no ``request_id`` generation) — the
-caller assembles a complete ``AuditRecord`` and hands it to ``emit``. This
-module reuses that same serialize-and-emit shape (``to_json_line``/``emit``
-below are a direct port), but it *does* add one more responsibility:
-``build_record`` turns a raw question string into ``question_len`` +
-``question_sha256`` and *never returns or stores the original string*
-anywhere. ``AC-SB-007-3`` requires the raw question to never reach the
-record — the safest way to guarantee that for every future caller is to make
-the length/hash transformation happen in exactly one place, inside this
-module, rather than trusting each call site (``worker.py``, ``handler.py``,
-...) to remember to hash before constructing a record by hand.
+Stage 1의 ``DSN-003``은 ``audit/logger.py``를 레코드 조립 로직(clock, ``request_id``
+생성 등) 없이 의도적으로 순수하게 유지한다 -- 호출자가 완성된 ``AuditRecord``를
+만들어 ``emit``에 넘긴다. 이 모듈도 같은 serialize-and-emit 형태를 재사용하지만
+(``to_json_line``/``emit``은 직접 포팅), 책임 하나를 더 진다: ``build_record``가
+원본 질문 문자열을 ``question_len`` + ``question_sha256``으로 바꾸고 *원본 문자열은
+어디에도 반환·저장하지 않는다*. ``AC-SB-007-3``이 원본 질문이 레코드에 절대
+닿으면 안 된다고 요구하는데, 이를 보장하는 가장 안전한 방법은 길이/해시 변환을
+이 모듈 한 곳에서만 하는 것이다 -- 각 호출부(``worker.py``, ``handler.py`` 등)가
+직접 레코드를 조립하기 전에 해시하는 걸 잊지 않길 바라는 것보다 낫다.
 
-Why the hash is truncated to 16 hex characters (``QUESTION_HASH_PREFIX_LEN``)
+해시를 16자로 자르는 이유(``QUESTION_HASH_PREFIX_LEN``)
 -------------------------------------------------------------------------------
-The full record already carries ``question_len``, so the hash's only job is
-to let an operator notice "this is the same question as that other row" or
-correlate with a support ticket that also has the question text on hand to
-re-hash and compare — it is not meant to be collision-proof against a
-deliberate adversary. 16 hex characters (64 bits) is effectively unique for
-this purpose while keeping log volume down across a high query rate; SHA-256
-itself (not a faster/weaker hash) is used because it is already a dependency
-of nothing new, is one-way, and reversing even a 16-character prefix back to
-the original question is computationally infeasible — the truncation only
-costs the operator collision-resistance headroom they never needed, not any
-practical amount of pre-image resistance.
+레코드에 이미 ``question_len``이 있으므로 해시의 역할은 "이 행이 다른 행과 같은
+질문이다"를 알아채거나, 질문 원문을 가진 지원 티켓과 재해시해 대조하는 정도다 --
+의도적 공격자에 대한 충돌 내성까지는 필요 없다. 16 hex 문자(64비트)면 로그 볼륨을
+낮게 유지하면서도 이 목적엔 사실상 충분히 유일하다. SHA-256을 쓰는 이유는 새
+의존성이 필요 없고, 단방향이며, 16자 prefix만으로 원본 질문을 복원하는 게
+계산적으로 불가능하기 때문 -- truncation으로 잃는 건 애초에 필요 없던 충돌 내성
+여유분뿐, 실질적인 역상 저항성은 아니다.
 
-``usage`` — plain numbers only, never the SDK object (``AC-SB-007-2``, ``EDGE-SB-017``)
+``usage`` -- SDK 객체가 아니라 순수 숫자만(``AC-SB-007-2``, ``EDGE-SB-017``)
 -------------------------------------------------------------------------------------------
-**This module never imports ``anthropic``.** Measured cost: 1,384 ms
-(workspace PLAN §1) — paid once per cold start for whichever Lambda imports
-it, and this module must stay importable from the handler's 3-second ACK
-budget too (``CTR-SB-002``), not just the worker's. ``build_record`` therefore
-accepts ``usage`` as a plain ``Mapping[str, int | None]`` (or ``None``) — the caller
-(``ask.py``/``worker.py``) is responsible for pulling ``input_tokens``/
-``output_tokens``/``cache_read_input_tokens`` off the Anthropic SDK's usage
-object *before* calling here. Passing the SDK object itself in would either
-break JSON serialization outright or leak whatever other fields that object
-happens to carry. ``usage`` is ``None`` on the ``denied``/most ``error``
-paths (no Claude API call was ever made — nothing to report), and any of the
-three keys may be absent even when present (a failed/partial response) —
-both are handled without raising.
+**이 모듈은 ``anthropic``을 절대 import하지 않는다.** 실측 비용 1,384ms(workspace
+PLAN §1) -- import하는 Lambda의 콜드스타트마다 치러야 하고, 이 모듈은 worker뿐
+아니라 handler의 3초 ACK 예산(``CTR-SB-002``)에서도 import 가능해야 한다.
+그래서 ``build_record``는 ``usage``를 순수 ``Mapping[str, int | None]``(또는
+``None``)로 받는다 -- 호출자(``ask.py``/``worker.py``)가 여기 넘기기 *전에*
+Anthropic SDK의 usage 객체에서 ``input_tokens``/``output_tokens``/
+``cache_read_input_tokens``를 뽑아둬야 한다. SDK 객체 자체를 넘기면 JSON
+직렬화가 아예 깨지거나 그 객체가 우연히 가진 다른 필드가 유출될 수 있다.
+``denied``/대부분의 ``error`` 경로에서는 Claude API 호출 자체가 없었으므로
+``usage``가 ``None``이고, 세 키 중 일부가 없어도(응답 실패/부분 응답) 예외 없이
+처리된다.
 
-Single-line guarantee (``AC-SB-007-1``)
+한 줄 보장(``AC-SB-007-1``)
 ------------------------------------------
-Same mechanism as Stage 1's ``CTR-003`` records: ``json.dumps`` with no
-``indent`` never emits a literal newline, and escapes every control
-character (including an embedded ``\\n``/``\\r`` inside, say, a Korean
-``reason_code`` string) as a multi-character escape sequence instead. One
-CloudWatch/Lambda log line in == one JSON record out, no matter what
-``reason_code``/``error_kind`` a caller passes in.
+Stage 1의 ``CTR-003`` 레코드와 같은 메커니즘: ``indent`` 없는 ``json.dumps``는
+리터럴 줄바꿈을 절대 만들지 않고, 모든 제어 문자(예를 들어 한국어 ``reason_code``
+문자열에 섞인 ``\\n``/``\\r``도)를 멀티 문자 escape 시퀀스로 바꾼다. 어떤
+``reason_code``/``error_kind``가 들어와도 CloudWatch/Lambda 로그 한 줄 == JSON
+레코드 하나.
 
-``ensure_ascii=True`` (deliberate, not the library default's accidental
-side effect)
+``ensure_ascii=True``(의도적 선택, 라이브러리 기본값의 우연한 부작용이 아님)
 -------------------------------------------------------------------------
-``reason_code`` can carry non-ASCII text (a Korean-language reason surfaced
-from elsewhere in this package). ``ensure_ascii=True`` escapes every
-non-ASCII character to a ``\\uXXXX`` sequence, so the emitted line is pure
-ASCII regardless of what encoding assumption a downstream log shipper makes
-— matching Stage 1's ``CTR-003`` choice for the identical reason, so both
-servers' log lines are safe to `grep`/pipe through the same tooling without
-a mojibake risk either could introduce alone.
+``reason_code``는 비ASCII 텍스트(이 패키지 다른 곳에서 온 한국어 사유)를 담을 수
+있다. ``ensure_ascii=True``는 모든 비ASCII 문자를 ``\\uXXXX``로 escape해, 다운스트림
+로그 수집기가 어떤 인코딩을 가정하든 결과 줄이 순수 ASCII이게 한다 -- Stage 1의
+``CTR-003``과 동일한 이유로 동일한 선택이라, 두 서버의 로그 줄 모두 같은 도구로
+`grep`/파이프해도 mojibake 위험이 없다.
 
-Failure policy: recording must never kill the caller's real work
+실패 정책: 기록이 호출자의 실제 작업을 절대 방해하면 안 된다
 --------------------------------------------------------------------
-``signature.py``/``events.py`` are never-raises by contract; this module
-adopts the same stance for a different reason. A Slack query that Claude
-already answered (or that was correctly denied) must still reach the user
-even if writing *this* observability line fails (a closed stdout, a stream
-that raises on ``write``/``flush``). ``emit`` therefore catches every
-``Exception`` raised while writing, logs it once via the standard
-``logging`` module (operator-visible, never re-raised), and returns.
-``emit_query_observation`` extends the same guarantee to ``build_record``
-itself, so a caller that just wants "record this query, never let recording
-break anything" has exactly one function to call. Callers who need the
-individual pieces (tests, or a caller that wants to inspect the record
-before emitting it) can still call ``build_record``/``to_json_line``/``emit``
-directly — those remain unsuppressed (they will raise on a genuinely
-malformed call) so a test can tell "recording degraded" from "recording is
-outright buggy."
+``signature.py``/``events.py``는 계약상 never-raises다. 이 모듈도 같은 태도를
+다른 이유로 택한다 -- Claude가 이미 답했거나(또는 정당하게 거부됐거나) 한 Slack
+쿼리는 *이* 관측 줄 기록이 실패해도(닫힌 stdout, ``write``/``flush``에서
+raise하는 스트림) 사용자에게 반드시 도달해야 한다. 그래서 ``emit``은 쓰기 중
+발생하는 모든 ``Exception``을 catch해 표준 ``logging``으로 한 번 로그만 남기고
+(운영자에게는 보이되 re-raise는 안 함) 반환한다. ``emit_query_observation``은
+``build_record`` 자체에도 같은 보장을 확장해, "이 쿼리를 기록하되 기록이 절대
+다른 걸 깨면 안 된다"만 원하는 호출자가 함수 하나만 부르면 되게 한다. 개별
+조각이 필요한 호출자(테스트, 또는 emit 전에 레코드를 검사하고 싶은 호출자)는
+``build_record``/``to_json_line``/``emit``을 직접 불러도 된다 -- 이들은
+억제되지 않고 그대로 raise한다(잘못된 호출이면), 그래야 테스트가 "기록이
+degrade됐다"와 "기록 자체가 버그다"를 구분할 수 있다.
 
-Why stdout is safe here
+여기서 stdout이 안전한 이유
 ---------------------------
-Both Lambdas in this package (handler and worker) are invoked directly by
-the Lambda runtime, not over an stdio-based protocol — stdout carries no
-wire traffic for either, so the AWS Lambda log driver collecting it line by
-line (into the CloudWatch log group) is exactly the intended use, same
-rationale as Stage 1's ``audit/logger.py``.
+이 패키지의 두 Lambda(handler, worker) 모두 stdio 기반 프로토콜이 아니라 Lambda
+런타임이 직접 invoke한다 -- 즉 stdout이 어느 쪽에서도 wire 트래픽을 나르지
+않으므로, AWS Lambda 로그 드라이버가 줄 단위로 수집해(CloudWatch 로그 그룹으로)
+가는 것이 정확히 의도된 용도다. Stage 1의 ``audit/logger.py``와 같은 근거.
 """
 
 from __future__ import annotations
@@ -111,11 +93,11 @@ from typing import Final, Literal, Protocol
 
 logger = logging.getLogger(__name__)
 
-#: CTR-SB-008: the record kind. Fixed — every record this module emits has
-#: this exact value, there is no other kind of record in this file.
+#: CTR-SB-008: 레코드 종류. 고정값 -- 이 모듈이 emit하는 모든 레코드가 정확히 이
+#: 값을 가지며, 이 파일에는 다른 종류의 레코드가 없다.
 EVENT_SLACK_QUERY: Final = "slack_query"
 
-#: See the module docstring's "Why the hash is truncated" section.
+#: 모듈 docstring의 "해시를 16자로 자르는 이유" 절 참고.
 QUESTION_HASH_PREFIX_LEN: Final = 16
 
 __all__ = [
@@ -131,19 +113,18 @@ __all__ = [
     "to_json_line",
 ]
 
-#: CTR-SB-008's three outcome values. Matches Stage 1's ``AuditOutcome``
-#: shape exactly (``types.py``), kept as an independent alias here rather
-#: than imported — FRD §4.4 forbids a shared package between the two
-#: servers, so each keeps its own copy of this small contract.
+#: ``CTR-SB-008``의 outcome 값 3종. Stage 1의 ``AuditOutcome``(``types.py``)과
+#: 형태가 정확히 같지만 import하지 않고 여기서 독립된 alias로 둔다 -- FRD §4.4가
+#: 두 서버 간 공유 패키지를 금지하므로, 이 작은 계약도 각자 자기 복사본을 둔다.
 Outcome = Literal["ok", "denied", "error"]
 
 
 class ObservationStream(Protocol):
-    """The minimal stream capability ``emit`` needs — mirrors Stage 1's ``AuditStream``.
+    """``emit``에 필요한 최소 스트림 기능 -- Stage 1의 ``AuditStream``과 동일 패턴.
 
-    A structural ``Protocol`` (write + flush only) lets ``sys.stdout``, an
-    ``io.StringIO`` in tests, or any other write+flush sink satisfy it
-    without subclassing anything.
+    구조적 ``Protocol``(write + flush만)이라 ``sys.stdout``, 테스트의
+    ``io.StringIO``, 또는 write+flush를 갖춘 다른 어떤 sink도 서브클래싱 없이
+    만족시킬 수 있다.
     """
 
     def write(self, s: str, /) -> object: ...
@@ -152,12 +133,12 @@ class ObservationStream(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class UsageSummary:
-    """The three Claude API usage fields ``CTR-SB-008`` names — nothing else.
+    """``CTR-SB-008``이 지정한 Claude API usage 필드 3개 -- 그 외에는 없음.
 
-    Every field is independently nullable: the Anthropic SDK's usage object
-    can arrive with any subset of these populated depending on how the
-    response terminated (``EDGE-SB-017``), and this type only ever holds
-    plain numbers — never the SDK object itself (see module docstring).
+    모든 필드가 독립적으로 nullable: 응답이 어떻게 종료됐는지(``EDGE-SB-017``)에
+    따라 Anthropic SDK의 usage 객체는 이 중 임의의 부분집합만 채워져 올 수 있고,
+    이 타입은 항상 순수 숫자만 담는다 -- SDK 객체 자체는 절대 담지 않는다(모듈
+    docstring 참고).
     """
 
     input_tokens: int | None
@@ -167,50 +148,49 @@ class UsageSummary:
 
 @dataclass(frozen=True, slots=True)
 class ObservationRecord:
-    """One CTR-SB-008 record. Field set/names are fixed by the contract — see module docstring.
+    """``CTR-SB-008`` 레코드 1개. 필드셋/이름은 계약으로 고정 -- 모듈 docstring 참고.
 
-    Notably absent: the raw question text. There is no field here that could
-    hold it (``AC-SB-007-3``) — only ``question_len``/``question_sha256``,
-    which ``build_record`` derives from it without ever storing the original.
+    눈에 띄게 빠진 것: 원본 질문 텍스트. 이를 담을 수 있는 필드가 여기 없다
+    (``AC-SB-007-3``) -- ``question_len``/``question_sha256``만 있고,
+    ``build_record``가 원본을 저장하지 않은 채 이 값들을 유도한다.
     """
 
     ts: str
-    """Event time, ISO 8601 with a UTC offset — caller-supplied (this module
-    reads no clock, same reasoning as Stage 1's ``DSN-003``: a pure record
-    type is trivial to test without freezing time)."""
+    """이벤트 시각, UTC offset 포함 ISO 8601 -- 호출자가 제공(이 모듈은 clock을
+    읽지 않는다, Stage 1의 ``DSN-003``과 같은 이유: 순수 레코드 타입이면 시간을
+    고정하지 않고도 테스트가 쉽다)."""
 
     event: str
     slack_user_id: str | None
-    """``None`` when the caller could not be identified at all (``identity.py``'s
-    ``user_unidentified`` path) — distinct from an identified-but-unregistered
-    user, whose ``slack_user_id`` is still known and recorded."""
+    """호출자를 아예 식별할 수 없을 때 ``None``(``identity.py``의
+    ``user_unidentified`` 경로) -- 식별은 됐지만 미등록인 사용자와는 다르다,
+    그 경우 ``slack_user_id``는 알려져 있고 기록된다."""
 
     client_id: str | None
-    """The looked-up MCP client/person identifier (e.g. ``"okwon"``) — never a
-    token. ``None`` whenever no credential was resolved (denied/unidentified)."""
+    """조회된 MCP client/person 식별자(예: ``"okwon"``) -- 토큰이 아님. 자격증명이
+    전혀 resolve되지 않으면(denied/unidentified) ``None``."""
 
     channel: str | None
     thread_ts: str | None
     question_len: int
     question_sha256: str
-    """SHA-256 hex digest of the question, truncated to ``QUESTION_HASH_PREFIX_LEN``
-    characters. Never the question itself."""
+    """질문의 SHA-256 hex digest, ``QUESTION_HASH_PREFIX_LEN``자로 자름. 질문
+    원문은 절대 아님."""
 
     outcome: Outcome
     reason_code: str | None
-    """Operator-only classification of a ``denied``/``error`` outcome (e.g.
-    ``identity.py``'s ``reason_code``, ``idempotency.py``'s ``reason``). ``None``
-    for ``outcome="ok"``."""
+    """``denied``/``error`` outcome의 운영자 전용 분류(예: ``identity.py``의
+    ``reason_code``, ``idempotency.py``의 ``reason``). ``outcome="ok"``면
+    ``None``."""
 
     error_kind: str | None
-    """Exception class name for ``outcome="error"``, else ``None``."""
+    """``outcome="error"``일 때 예외 클래스명, 아니면 ``None``."""
 
     duration_ms: int
     usage: UsageSummary | None
-    """``None`` when no Claude API call was ever made for this query (most
-    ``denied``/some ``error`` outcomes) — distinct from a call that returned
-    with some usage fields missing, which is an ``UsageSummary`` with one or
-    more ``None`` fields."""
+    """이 쿼리에 대해 Claude API 호출이 아예 없었으면(대부분의 ``denied``/일부
+    ``error``) ``None`` -- 호출은 됐지만 usage 필드 일부가 없는 경우
+    (``UsageSummary``의 필드 일부가 ``None``)와는 다르다."""
 
     request_id: str
 
@@ -230,20 +210,18 @@ def build_record(
     usage: Mapping[str, int | None] | None,
     request_id: str,
 ) -> ObservationRecord:
-    """Build one ``ObservationRecord`` for ``question`` (``AC-SB-007-3``, ``CTR-SB-008``).
+    """``question``에 대한 ``ObservationRecord`` 1개를 만든다(``AC-SB-007-3``, ``CTR-SB-008``).
 
-    ``question`` is used only to compute ``question_len``/``question_sha256``
-    — it is never copied into the returned record and this function never
-    logs it. This is the *only* place in the package that should ever derive
-    a length/hash pair from a question; every caller building an
-    ``ObservationRecord`` should route through here rather than hashing a
-    question itself.
+    ``question``은 ``question_len``/``question_sha256`` 계산에만 쓰인다 --
+    반환되는 레코드에 절대 복사되지 않고 이 함수는 로그도 남기지 않는다. 이
+    패키지에서 질문 문자열로부터 길이/해시 쌍을 유도해야 하는 곳은 *여기뿐*이다
+    -- ``ObservationRecord``를 만드는 모든 호출자는 직접 해시하지 말고 이 함수를
+    거쳐야 한다.
 
-    ``usage`` accepts a plain mapping with up to three integer keys
-    (``input_tokens``, ``output_tokens``, ``cache_read_input_tokens``) — never
-    the Anthropic SDK's usage object (module docstring). Pass ``None`` when no
-    Claude API call happened; a present mapping may omit any of the three keys
-    safely.
+    ``usage``는 정수 키 최대 3개(``input_tokens``, ``output_tokens``,
+    ``cache_read_input_tokens``)를 가진 순수 매핑만 받는다 -- Anthropic SDK의
+    usage 객체는 절대 안 됨(모듈 docstring 참고). Claude API 호출이 없었으면
+    ``None``을 넘긴다. 매핑이 있어도 세 키 중 일부를 안전하게 생략할 수 있다.
     """
     return ObservationRecord(
         ts=ts,
@@ -278,12 +256,12 @@ def _summarize_usage(usage: Mapping[str, int | None] | None) -> UsageSummary | N
 
 
 def to_json_line(record: ObservationRecord) -> str:
-    """Serialize ``record`` to one CTR-SB-008 JSON line (no trailing newline).
+    """``record``를 ``CTR-SB-008`` JSON 한 줄로 직렬화한다(끝에 줄바꿈 없음).
 
-    Pure — no I/O — so serialization can be tested directly, without a
-    stream to capture. Field names/order match ``CTR-SB-008`` exactly; do not
-    rename these keys, operators query CloudWatch Logs Insights by them. See
-    the module docstring for why ``ensure_ascii=True`` is deliberate here.
+    순수 함수 -- I/O 없음 -- 이라 스트림을 캡처하지 않고도 직렬화를 바로 테스트할
+    수 있다. 필드명/순서는 ``CTR-SB-008``과 정확히 일치해야 한다 -- 운영자가 이
+    키로 CloudWatch Logs Insights를 쿼리하므로 rename 금지. ``ensure_ascii=True``가
+    왜 의도적인지는 모듈 docstring 참고.
     """
     usage_payload: dict[str, int | None] | None = (
         None
@@ -314,15 +292,14 @@ def to_json_line(record: ObservationRecord) -> str:
 
 
 def emit(record: ObservationRecord, *, stream: ObservationStream | None = None) -> None:
-    """Write one observation line for ``record`` and flush it. Never raises.
+    """``record``에 대한 관측 줄 하나를 쓰고 flush한다. 절대 raise하지 않는다.
 
-    ``stream`` defaults to the caller's current ``sys.stdout``, resolved at
-    call time (not at function-definition time), same as Stage 1's
-    ``audit/logger.py``. Any failure while writing/flushing (a closed stream,
-    a stream that raises) is caught, logged once via the standard ``logging``
-    module, and swallowed — see the module docstring's "Failure policy". The
-    line and its trailing newline are written in a single ``write`` call so
-    nothing else sharing the stream can interleave a partial line between them.
+    ``stream`` 기본값은 호출 시점(함수 정의 시점이 아님)에 resolve되는 호출자의
+    현재 ``sys.stdout`` -- Stage 1의 ``audit/logger.py``와 동일. 쓰기/flush 중
+    실패(닫힌 스트림, raise하는 스트림)는 catch해 표준 ``logging``으로 한 번
+    로그만 남기고 삼킨다 -- 모듈 docstring "실패 정책" 절 참고. 줄과 끝의
+    줄바꿈은 단일 ``write`` 호출로 함께 쓴다 -- 그래야 같은 스트림을 공유하는
+    다른 무언가가 그 사이에 부분 줄을 끼워 넣을 수 없다.
     """
     out: ObservationStream = sys.stdout if stream is None else stream
     try:
@@ -352,13 +329,12 @@ def emit_query_observation(
     request_id: str,
     stream: ObservationStream | None = None,
 ) -> None:
-    """Build and emit one query's observation record in a single, never-raising call.
+    """쿼리 1건의 관측 레코드를 만들고 emit까지, 절대 raise하지 않는 호출 1번으로.
 
-    The recommended entry point for ``worker.py``/``handler.py``: builds the
-    record (``build_record``) and writes it (``emit``) inside one ``try``, so
-    a failure in *either* step — not just the write — can never propagate to
-    the caller and interrupt a Slack reply that has already been decided.
-    See the module docstring's "Failure policy".
+    ``worker.py``/``handler.py``의 권장 진입점: 레코드를 만들고(``build_record``)
+    쓰는(``emit``) 두 단계를 ``try`` 하나 안에서 수행해, *둘 중 어느 단계*가
+    실패하든(쓰기뿐 아니라) 이미 결정된 Slack 응답을 방해하며 호출자에게 전파되는
+    일이 없게 한다. 모듈 docstring "실패 정책" 절 참고.
     """
     try:
         record = build_record(

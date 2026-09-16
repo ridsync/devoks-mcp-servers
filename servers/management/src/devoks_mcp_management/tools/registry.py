@@ -1,16 +1,14 @@
-"""Tool registry — the single collection point for layer adapters' tools (DSN-005, TASK-008).
+"""Tool 레지스트리 — 계층 어댑터들의 tool을 모으는 단일 수집점(DSN-005, TASK-008).
 
-``register_tools`` is the only place that knows *which* layer adapters exist.
-Every other module (``server.py``, an adapter's own ``tools.py``) stays
-ignorant of that list. Adding a new source (Notion, Sentry, a second GitHub
-org, ...) is meant to cost exactly one directory plus one line here:
+`register_tools`만이 어떤 어댑터가 존재하는지 안다. 다른 모듈(`server.py`,
+어댑터 자신의 `tools.py`)은 그 목록을 몰라도 된다. 새 소스(Notion, Sentry,
+두 번째 GitHub org 등)를 추가하는 비용은 디렉토리 1개 + 아래 튜플에 한
+줄로 고정돼 있다:
 
-1. Create ``adapters/<layer>/<source>/tools.py`` exposing a
-   ``register(mcp: MCPServer, guard: Guard) -> None`` function that decorates
-   its async tool functions with ``guard(...)`` and adds them to ``mcp``
-   (via ``@mcp.tool()`` or ``mcp.add_tool(...)``).
-2. Import that function above ``_ADAPTER_REGISTRARS`` and append it to the
-   tuple, e.g.::
+1. `adapters/<layer>/<source>/tools.py`에 `register(mcp: MCPServer, guard:
+   Guard) -> None`을 구현한다 — 자신의 async tool 함수를 `guard(...)`로
+   감싸(`@mcp.tool()` 또는 `mcp.add_tool(...)`) `mcp`에 등록한다.
+2. 그 함수를 `_ADAPTER_REGISTRARS` 위에서 import해 튜플에 추가한다::
 
        from devoks_mcp_management.adapters.knowledge.github.tools import (
            register as register_github_tools,
@@ -18,38 +16,36 @@ org, ...) is meant to cost exactly one directory plus one line here:
 
        _ADAPTER_REGISTRARS: tuple[Registrar, ...] = (register_github_tools,)
 
-Stage 1 ships with **zero** adapters — ``adapters/knowledge/github/tools.py``
-is TASK-022's job, which depends on TASK-020/021 (GitHub credentials + REST
-client) and is out of scope here. ``_ADAPTER_REGISTRARS`` therefore starts
-empty and ``register_tools`` is a deliberate no-op on an empty tuple: the
-server boots with an empty tool surface, and ``tools/list`` returns ``[]``
-(AC-001-2). This module never registers a placeholder/dummy tool to fill
-that gap — a fake tool would show up in the real, audited tool surface this
-server exists to protect (see TASK-008 handover notes for the reasoning).
+Stage 1은 어댑터 **0개**로 출발한다 — `adapters/knowledge/github/tools.py`는
+TASK-022 소관(TASK-020/021 의존, 이 태스크 범위 밖)이다. 그래서
+`_ADAPTER_REGISTRARS`는 빈 튜플로 시작하고 `register_tools`는 빈 튜플에
+대해 의도적 no-op — 서버는 빈 tool 표면으로 기동하고 `tools/list`는
+`[]`를 반환한다(AC-001-2). 이 모듈은 그 공백을 메우려고
+placeholder/dummy tool을 절대 등록하지 않는다 — 가짜 tool이 이 서버가
+보호하려는 실제 감사 대상 tool 표면에 섞여들기 때문이다(근거는 TASK-008
+handover 노트 참고).
 
-Dependency timing (for TASK-022/023, DSN-004 / DSN-005)
----------------------------------------------------------
-A tool is *registered* here at server-construction time (``create_server``,
-called once at process startup), but the GitHub client that TASK-022's tools
-need does not exist yet at that point — ``DSN-004`` puts its construction in
-the ASGI app's ``lifespan`` (TASK-023, ``app.py``), which only runs once the
-server starts serving requests. Registration and dependency construction are
-therefore two different points in time, and a registrar function must not
-try to close over a client instance built during import/registration.
+의존성 타이밍(TASK-022/023용, DSN-004 / DSN-005)
+---------------------------------------------------
+tool은 서버 구성 시점(`create_server`, 프로세스 기동 시 1회)에 여기서
+*등록*되지만, TASK-022의 tool이 필요로 하는 GitHub client는 그 시점엔
+아직 없다 — DSN-004가 그 생성을 ASGI 앱의 `lifespan`(TASK-023,
+`app.py`)에 두었고, 이는 서버가 요청을 받기 시작해야 실행된다. 등록과
+의존성 생성은 서로 다른 시점이므로, registrar 함수가 import/등록
+과정에서 만들어진 client 인스턴스를 클로저로 가두려 하면 안 된다.
 
-The SDK's own answer to this is the ``Context`` parameter (see
-``mcp.server.mcpserver.context.Context``, and
-<https://py.sdk.modelcontextprotocol.io/handlers/lifespan/index.md>): a tool
-function that adds a parameter annotated ``ctx: Context`` gets it injected
-per-call, and ``ctx.request_context.lifespan_context`` is exactly the object
-``lifespan`` yielded at startup. So the expected TASK-022/023 shape is::
+SDK가 제시하는 답은 `Context` 파라미터다(`mcp.server.mcpserver.context.
+Context`,
+<https://py.sdk.modelcontextprotocol.io/handlers/lifespan/index.md>) —
+tool 함수에 `ctx: Context` 파라미터를 추가하면 호출마다 주입되고,
+`ctx.request_context.lifespan_context`가 바로 `lifespan`이 기동 시
+yield한 값이다. TASK-022/023이 따를 예상 형태::
 
-    # app.py (TASK-023) builds the client once, in an @asynccontextmanager
-    # lifespan function passed to MCPServer(..., lifespan=...), and yields
-    # it as the lifespan context (a dataclass/TypedDict if more than one
-    # value is ever needed).
+    # app.py(TASK-023)가 @asynccontextmanager lifespan 함수(MCPServer(...,
+    # lifespan=...)에 전달) 안에서 client를 한 번 만들어 lifespan context로
+    # yield한다(값이 여럿이면 dataclass/TypedDict).
 
-    # adapters/knowledge/github/tools.py (TASK-022)
+    # adapters/knowledge/github/tools.py(TASK-022)
     @guard("read_file", repo_arg="repo", audit_args=("repo", "path", "ref"))
     async def read_file(repo: str, path: str, ctx: Context, ref: str | None = None) -> str:
         client: GitHubClient = ctx.request_context.lifespan_context.github_client
@@ -59,9 +55,9 @@ per-call, and ``ctx.request_context.lifespan_context`` is exactly the object
         mcp.add_tool(read_file)
         ...
 
-This registry does not need to know about that ``Context`` plumbing at all —
-it only ever forwards ``mcp`` and ``guard`` to each registrar unchanged, so
-this file needs no change when TASK-023 wires the lifespan.
+이 레지스트리는 그 `Context` 배선을 전혀 몰라도 된다 — `mcp`/`guard`를
+그대로 각 registrar에 전달할 뿐이므로, TASK-023이 lifespan을 배선해도 이
+파일은 바뀔 필요가 없다.
 """
 
 from __future__ import annotations
@@ -74,38 +70,36 @@ from devoks_mcp_management.adapters.knowledge.github.tools import register as re
 if TYPE_CHECKING:
     from mcp.server.mcpserver import MCPServer
 
-#: The decorator factory ``tools.guard.make_tool_guard(settings)`` returns —
-#: ``guard(tool, *, repo_arg=None, audit_args=())`` applied to a tool
-#: function. Registrars receive this already built (one per server
-#: instance) rather than building their own, so every registered tool shares
-#: one ``Settings``/audit sink.
+#: `tools.guard.make_tool_guard(settings)`가 반환하는 데코레이터 팩토리 —
+#: `guard(tool, *, repo_arg=None, audit_args=())`를 tool 함수에 적용한다.
+#: registrar는 이미 만들어진 것을 전달받는다(서버 인스턴스당 1개) — 자체
+#: 생성하지 않으므로, 등록된 모든 tool이 하나의 `Settings`/감사 sink를
+#: 공유한다.
 #:
-#: ``guard.py`` types this more precisely as
-#: ``Callable[..., Callable[[F], F]]`` for an async-tool-bound ``F`` — that
-#: TypeVar only ever gets solved at the point a *specific* tool function is
-#: decorated (inside an adapter's own ``tools.py``), not here, where the
-#: callable is only ever forwarded, never applied. Spelling the inner
-#: ``Callable`` with concrete ``Any`` boundaries (rather than re-declaring a
-#: local TypeVar tied to nothing) is what keeps this alias non-generic and
-#: therefore usable in a plain function signature below.
+#: `guard.py`는 이를 더 정밀하게 async-tool `F`에 대한
+#: `Callable[..., Callable[[F], F]]`로 타이핑하지만, 그 TypeVar는 실제 tool
+#: 함수를 데코레이트하는 지점(어댑터 자신의 `tools.py`)에서만 풀린다 —
+#: 여기서는 callable을 그대로 전달만 할 뿐 적용하지 않는다. 안쪽
+#: `Callable`을 아무 데도 안 묶인 로컬 TypeVar 대신 구체적인 `Any`
+#: 경계로 적는 것이 이 alias를 non-generic으로 유지해 아래 평범한 함수
+#: 시그니처에서 쓸 수 있게 한다.
 Guard = Callable[..., Callable[[Callable[..., Any]], Callable[..., Any]]]
 
-#: One registrar per adapter: ``(mcp, guard) -> None``, expected to register
-#: its tools onto ``mcp`` (typically via ``@guard(...)`` then
-#: ``mcp.add_tool``) and return nothing.
+#: 어댑터당 registrar 1개: `(mcp, guard) -> None`. `mcp`에 자신의 tool을
+#: 등록하고(보통 `@guard(...)` 후 `mcp.add_tool`) 아무것도 반환하지 않는다.
 Registrar = Callable[["MCPServer", Guard], None]
 
-#: DSN-005 collection point. See module docstring for how TASK-022 appends
-#: to this.
+#: DSN-005 수집점. TASK-022가 여기에 어떻게 추가하는지는 모듈 docstring
+#: 참고.
 _ADAPTER_REGISTRARS: tuple[Registrar, ...] = (register_github_tools,)
 
 
 def register_tools(mcp: MCPServer, guard: Guard) -> None:
-    """Register every layer adapter's tools onto ``mcp``.
+    """모든 계층 어댑터의 tool을 `mcp`에 등록한다.
 
-    Called once from ``server.create_server`` after ``guard`` has been built
-    for that server instance. A no-op when ``_ADAPTER_REGISTRARS`` is empty
-    (Stage 1's current state, AC-001-2) — no exception, no placeholder tool.
+    `server.create_server`가 해당 서버 인스턴스의 `guard`를 만든 뒤 1회
+    호출한다. `_ADAPTER_REGISTRARS`가 비어 있으면(Stage 1의 현재 상태,
+    AC-001-2) no-op — 예외도 없고 placeholder tool도 없다.
     """
     for register in _ADAPTER_REGISTRARS:
         register(mcp, guard)

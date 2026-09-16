@@ -1,55 +1,34 @@
-"""Slack user ID -> MCP credential lookup, localized to this file (DSN-SB-003, TASK-005).
+"""Slack user ID -> MCP 자격증명 조회, 이 파일에 국지화 (DSN-SB-003, TASK-005).
 
-Same intent as Stage 1's ``DSN-001`` localizing the auth-verification swap
-point to ``verifier.py``: when the static ``SLACK_USER_TOKEN_MAP`` (env-parsed
-by ``config.py``) is eventually replaced by an OAuth-backed lookup (Stage 1
-§10 trigger), **this file** is the only edit required. No other module in this
-package may index ``WorkerSettings.user_token_map`` directly — every lookup
-goes through ``resolve_credentials`` below.
+Stage 1 ``DSN-001``(인증 검증 교체 지점을 ``verifier.py``에 국지화)과 같은
+의도 — ``SLACK_USER_TOKEN_MAP``이 OAuth 기반 조회로 교체될 때(Stage 1 §10
+트리거) 이 파일만 고치면 되도록, ``WorkerSettings.user_token_map``은 다른
+모듈이 직접 인덱싱하지 않고 반드시 ``resolve_credentials``를 거친다.
 
-``REQ-SB-004`` / ``CTR-SB-006``: each Slack user queries with *their own* MCP
-token, so Stage 1's per-token audit trail (``CTR-003``) becomes per-person.
+``REQ-SB-004`` / ``CTR-SB-006``: 사용자마다 자신의 MCP 토큰으로 조회 → Stage 1의
+토큰별 감사 추적(``CTR-003``)이 사람별로 이어진다.
 
-**Security requirements this module exists to satisfy — the three are easy to
-get quietly wrong (``AC-SB-004-1..4``, ``EDGE-SB-006``, ``EDGE-SB-012``):**
+보안 요구사항(``AC-SB-004-1..4``, ``EDGE-SB-006``, ``EDGE-SB-012``, 놓치기 쉬움):
 
-1. **No information disclosure (``AC-SB-004-3``).** The user-facing denial
-   message is the *same fixed string* regardless of whether the caller was
-   unidentifiable (``user_id is None``, see below) or a valid-but-unregistered
-   Slack user ID, and regardless of the mapping's size or contents. This is
-   the same two-layer split as
-   ``servers/management/src/devoks_mcp_management/auth/policy.py``'s
-   ``AuthorizationDecision``: a single ``client_message`` for every denial
-   reason, plus an operator-only ``reason_code`` that *does* distinguish.
-2. **No token exposure (``AC-SB-004-4``).** ``CredentialLookupResult.mcp_token``
-   is excluded from ``repr`` (``field(repr=False)``, the same pattern as
-   ``config.py``'s ``HandlerSettings``/``WorkerSettings``), and no log
-   statement in this module ever formats a token value.
-3. **No timing signal.** The identified-but-unregistered and
-   unidentifiable-caller paths do the same shape of work (one attribute
-   check, one optional dict lookup) rather than one returning early and the
-   other doing extra validation — a dict lookup's own timing difference is
-   already small, but a structurally different code path would widen it.
+1. **정보 노출 금지 (AC-SB-004-3).** 미식별(``user_id is None``)/미등록 둘 다
+   클라이언트엔 동일한 고정 문구, 구분은 운영자 전용 ``reason_code``로만 —
+   management ``AuthorizationDecision``과 같은 2계층 분리.
+2. **토큰 미노출 (AC-SB-004-4).** ``mcp_token``은 ``field(repr=False)``, 어떤
+   로그도 토큰 값을 포맷하지 않는다.
+3. **타이밍 신호 없음.** 두 거부 경로 모두 같은 모양의 작업(속성 체크 + 옵셔널
+   dict 조회)만 하며 한쪽만 조기 반환하지 않는다.
 
-Unlike ``policy.py`` (deliberately I/O-free), this module *does* call
-``logging`` directly. FRD ``EDGE-SB-012``/the "운영자 로그에서는 구분됨"
-requirement asks for operator-visible signals (an oversized-mapping warning,
-and unidentified vs. unregistered distinguished) that have no other natural
-home — this file returns a lookup *result*, it never posts to Slack itself
-(that is ``TASK-010``/``TASK-014``'s job) — so logging them here keeps
-``DSN-SB-003``'s localization intact instead of pushing mapping-shaped
-knowledge out to every caller.
+``policy.py``와 달리 여기선 ``logging``을 직접 호출한다 — 매핑 크기 경고,
+미식별/미등록 구분 같은 운영자 신호(``EDGE-SB-012``)를 이 파일의 반환값엔
+담을 곳이 없어서다. 그래야 ``DSN-SB-003`` 국지화가 유지된다.
 
-Input contract: this module takes ``user_id: str | None`` — the **already
-extracted** value from ``slack/events.py``'s ``extract_user_id`` (``TASK-004``,
-``EDGE-SB-019``'s localization) — never a raw payload. ``extract_user_id`` can
-return ``None`` for a structurally valid ``app_mention`` whose ``user`` field
-is missing/non-string/empty, which is a distinct situation from "a real user ID
-that just isn't registered" — both are denied, but the operator log tells them
-apart.
+입력 계약: ``user_id``는 ``slack/events.py``의 ``extract_user_id``
+(``TASK-004``, ``EDGE-SB-019``)가 이미 추출한 값 — 원본 payload가 아니다.
+``user`` 필드가 없거나 타입이 안 맞으면 ``None``이 반환되는데, "등록 안 된
+진짜 ID"와는 다른 상황이며 둘 다 거부되지만 운영자 로그에서는 구분된다.
 
-Import budget: no boto3, no anthropic, no HTTP/ASGI (pure logic + stdlib
-``logging`` only).
+Import budget: boto3/anthropic/HTTP/ASGI 없음 — 순수 로직 + stdlib
+``logging``만.
 """
 
 from __future__ import annotations
@@ -61,35 +40,28 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-#: AC-SB-004-3: the single user-facing denial message. Every denial branch in
-#: ``resolve_credentials`` returns exactly this string — never one derived
-#: from the requested user ID, the mapping's size, or which check failed. A
-#: caller must not be able to distinguish "you were never identified" from
-#: "your ID isn't registered" from "nobody is registered yet".
+#: AC-SB-004-3: 고정 거부 문구 — 요청 ID/매핑 크기/실패 사유와 무관하게 모든
+#: 거부 분기가 이 문자열만 반환한다. "미식별"과 "미등록"을 클라이언트가
+#: 구분할 수 없어야 한다.
 _CLIENT_DENIAL_MESSAGE = "등록되지 않은 사용자입니다. 관리자에게 등록을 요청해 주세요."
 
-#: Audit-only classification of why ``resolve_credentials`` denied a lookup.
-#: Never surfaced to the client (see module docstring).
+#: 감사 전용 거부 사유 분류. 클라이언트에는 절대 노출하지 않는다(모듈 docstring 참고).
 ReasonCode = Literal["user_unidentified", "user_unregistered"]
 
-#: EDGE-SB-012: same threshold as Stage 1 §10's OAuth-transition trigger
-#: ①(client count 10) — deliberately reused, not re-derived. Stage 1 measured
-#: ~123 B/client against the Lambda 4 KB aggregate env-var ceiling
-#: (``EDGE-021``); ``SLACK_USER_TOKEN_MAP`` entries cost roughly 60 B each (11 B
-#: Slack user ID + 43 B MCP token + JSON delimiters), so worker has more
-#: headroom than handler did — but "more headroom" is not "unbounded", and
-#: reusing the same trigger point keeps one place, not two, deciding when
-#: env-var-based credentials stop scaling.
+#: EDGE-SB-012: Stage 1 §10 OAuth 전환 트리거 ①(client 10개)과 동일 임계값을
+#: 재사용(재산정 아님). Stage 1 실측 ~123B/client 대비 Lambda 4KB env-var 상한
+#: (``EDGE-021``), ``SLACK_USER_TOKEN_MAP``은 항목당 ~60B(Slack user ID 11B +
+#: MCP 토큰 43B + JSON 구분자)라 worker가 더 여유 있지만 "여유 있음"이 "무한"은
+#: 아니므로, 같은 트리거 지점을 재사용해 판단 지점을 하나로 유지한다.
 MAPPING_SIZE_WARNING_THRESHOLD = 10
 
 
 @dataclass(frozen=True, slots=True)
 class CredentialLookupResult:
-    """Result of one ``resolve_credentials`` call.
+    """``resolve_credentials`` 호출 1회의 결과.
 
-    ``mcp_token`` is only set when ``granted`` is True. It is excluded from
-    ``repr`` unconditionally (``AC-SB-004-4``) — a stray log or exception of
-    this object can never format the token, even for a granted result.
+    ``mcp_token``은 ``granted``가 True일 때만 설정되고, ``repr``에서는 무조건
+    제외된다(``AC-SB-004-4``) — 우발적인 로그/예외 출력이 토큰을 노출하지 않는다.
     """
 
     granted: bool
@@ -102,26 +74,21 @@ def resolve_credentials(
     user_id: str | None,
     user_token_map: Mapping[str, str],
 ) -> CredentialLookupResult:
-    """Look up the MCP token for ``user_id`` in ``user_token_map``.
+    """``user_token_map``에서 ``user_id``의 MCP 토큰을 조회한다.
 
-    ``user_id`` is the value already returned by ``slack/events.py``'s
-    ``extract_user_id`` — pass ``None`` through as-is when that function
-    could not identify a caller; this function does not re-derive identity
-    from a payload.
+    ``user_id``는 ``slack/events.py``의 ``extract_user_id``가 이미 추출한
+    값 — ``None``도 그대로 통과시키며, payload에서 다시 식별하지 않는다.
 
-    Returns a granted result carrying the caller's own MCP token
-    (``AC-SB-004-1``) when ``user_id`` is a non-empty string present in
-    ``user_token_map`` with a non-empty token value. Every other case —
-    ``user_id is None``, an empty string, a missing key, or an empty-string
-    token value (defensive: ``config.py`` already rejects these at parse
-    time, but this function does not trust that its caller always went
-    through that path) — denies with the identical client-facing message
-    (``AC-SB-004-2``, ``AC-SB-004-3``, ``EDGE-SB-006``) and only the
-    operator-only ``reason_code`` differs.
+    ``user_id``가 비어있지 않은 문자열이고 ``user_token_map``에 비어있지 않은
+    토큰으로 존재하면 승인(``AC-SB-004-1``). 그 외 모든 경우(``None``, 빈
+    문자열, 키 없음, 빈 토큰값 — ``config.py``가 파싱 시점에 이미 막지만 이
+    함수는 호출자가 항상 그 경로를 거쳤다고 신뢰하지 않는다)는 동일한 클라이언트
+    메시지로 거부(``AC-SB-004-2``, ``AC-SB-004-3``, ``EDGE-SB-006``),
+    ``reason_code``만 다르다.
 
-    Also logs an operator-only warning once per call if ``user_token_map``
-    exceeds ``MAPPING_SIZE_WARNING_THRESHOLD`` (``EDGE-SB-012``) — never
-    including the mapping's keys/values, only its size.
+    ``user_token_map``이 ``MAPPING_SIZE_WARNING_THRESHOLD``를 넘으면 호출마다
+    운영자 전용 경고 로그를 남긴다(``EDGE-SB-012``) — 매핑의 키/값은 절대
+    포함하지 않고 크기만 남긴다.
     """
     _warn_if_mapping_oversized(user_token_map)
 
