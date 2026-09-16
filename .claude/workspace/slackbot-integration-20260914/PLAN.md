@@ -4,7 +4,7 @@ id: PLAN-slackbot-integration
 title: Slackbot 연동 (Stage 3) 작업 계획
 status: in-progress
 frd: ./FRD.md
-updated: 2026-09-14
+updated: 2026-09-16
 issue: https://github.com/ridsync/devoks-mcp-servers/issues/4
 ---
 
@@ -161,6 +161,7 @@ issue: https://github.com/ridsync/devoks-mcp-servers/issues/4
 - [x] `TASK-034` 사람별 MCP 토큰 발급 — MCP 서버 `MCP_CLIENT_TOKENS`에 사람마다 1행 추가(`CTR-002` 스키마 그대로, **서버 코드 변경 없음**) + Slackbot 매핑 반영 — size: S — test: skip — file: `infra/02-secrets.sh` — traces: CTR-SB-006, CTR-002
 - [ ] `TASK-035` 🔴 Claude API 비용 가드 — Anthropic Console 사용량 한도 설정(**AWS 예산 알림은 이 비용을 잡지 못한다**) + 운영 런북에 관측 레코드로 사후 집계하는 절차 기록 — size: M — test: skip — file: `docs/RUNBOOK-slackbot.md` — traces: EDGE-SB-017
 - [ ] `TASK-036` 🔴 E2E 검증 — 실제 채널에서 멘션 → 스레드 답변 게시, 미등록 사용자 거부, 재시도 중복 억제, 연타 코얼레싱, per-person 감사 레코드의 `client_id`가 사람인지 확인 — size: M — test: skip — file: `docs/RUNBOOK-slackbot.md` — traces: AC-SB-003-1, AC-SB-004-2, AC-SB-006-1, EDGE-SB-004, EDGE-SB-015, EDGE-SB-020
+  - 2026-09-16 실측: traces 6개 중 5개 확인(`AC-SB-003-1`/`AC-SB-004-2`/`AC-SB-006-1`/`EDGE-SB-004`/`EDGE-SB-015` PASS), `EDGE-SB-020`(봇 미초대 채널)만 미검증 — 근거·재현 절차는 `docs/RUNBOOK-slackbot.md` 참고. `EDGE-SB-020` 확인 전까지 이 Task는 미완료로 유지.
 
 ## 4. Dependencies
 
@@ -212,6 +213,6 @@ flowchart TD
 - [ ] handler 의존성 격리 불변식 통과(`TASK-013`) — handler import 그래프에 Claude SDK 없음
 - [ ] CI 품질 게이트(ruff·pyright strict·pytest·OSV) 통과
 - [ ] handler `Init Duration` 실측이 `CTR-SB-002` 3초 예산 안 (`TASK-033`)
-- [ ] 실 Slack 워크스페이스에서 멘션 → 스레드 답변 왕복 성공, 감사 레코드 `client_id`가 사람 (`TASK-036`)
+- [x] 실 Slack 워크스페이스에서 멘션 → 스레드 답변 왕복 성공, 감사 레코드 `client_id`가 사람 (`TASK-036`, 2026-09-16 실측 — `docs/RUNBOOK-slackbot.md`)
 - [ ] Anthropic Console 사용량 한도 설정 완료 (`TASK-035`)
 - [ ] 시크릿 값이 대화·로그·커밋·Slack 메시지 어디에도 남지 않음
