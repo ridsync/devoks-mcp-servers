@@ -195,3 +195,7 @@ Management MCP는 `mcp.devoks.kr`에서, Slackbot은 handler/worker Lambda 2개�
 - [roadmap.md](roadmap.md) — 확장 예정 스펙(GitHub 쓰기 권한 등 아직 FRD로 확정되지 않은 아이디어)
 - [`../.claude/workspace/management-mcp-bootstrap-20260903/FRD.md`](../.claude/workspace/management-mcp-bootstrap-20260903/FRD.md) / `PLAN.md` — Management 요구사항·설계·작업 분해
 - [`../.claude/workspace/slackbot-integration-20260914/FRD.md`](../.claude/workspace/slackbot-integration-20260914/FRD.md) / `PLAN.md` — Slackbot 요구사항·설계·작업 분해
+
+## 라이선스
+
+MIT License — Copyright (c) 2026 DevOKs-Lab. 전체 조항은 [`../LICENSE.md`](../LICENSE.md)를 참고하세요.

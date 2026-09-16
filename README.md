@@ -198,3 +198,7 @@ Management MCP runs live at `mcp.devoks.kr`, and Slackbot runs live as two Lambd
 - [docs/roadmap.md](docs/roadmap.md) — Planned expansion specs (ideas not yet finalized as an FRD, such as GitHub write access)
 - [`.claude/workspace/management-mcp-bootstrap-20260903/FRD.md`](.claude/workspace/management-mcp-bootstrap-20260903/FRD.md) / `PLAN.md` — Management requirements, design, task breakdown
 - [`.claude/workspace/slackbot-integration-20260914/FRD.md`](.claude/workspace/slackbot-integration-20260914/FRD.md) / `PLAN.md` — Slackbot requirements, design, task breakdown
+
+## License
+
+MIT License — Copyright (c) 2026 DevOKs-Lab. See [LICENSE.md](LICENSE.md) for the full text.
