@@ -13,8 +13,8 @@
 
 | 서버 | 경로 | 설명 |
 |---|---|---|
-| Management MCP | [`servers/management`](../servers/management) | GitHub Knowledge 어댑터 기반 MCP 서버(`mcp` SDK + Starlette). `https://mcp.devoks.kr/mcp`에서 서비스 중 |
-| Slackbot | [`servers/slackbot`](../servers/slackbot) | Slack Events API ↔ Claude API MCP 커넥터 브리지. AWS Lambda(handler/worker)로 배포돼 Slack 워크스페이스에서 동작 |
+| Management MCP | [`servers/management`](../servers/management) | 에이전트 클라이언트가 직접 연결하는 지식 게이트웨이(`devoks-management-mcp`) — Knowledge/Runtime/Business 어댑터와 Auth/RBAC/Audit 골격을 소유. GitHub Knowledge 어댑터 기반 MCP 서버(`mcp` SDK + Starlette). `https://mcp.devoks.kr/mcp`에서 서비스 중 |
+| Slackbot | [`servers/slackbot`](../servers/slackbot) | 자체 지식 소스가 아니라 채널 — Slack 사용자를 인증해 질문을 Management MCP로 넘긴다. Slack Events API ↔ Claude API MCP 커넥터 브리지. AWS Lambda(handler/worker)로 배포돼 Slack 워크스페이스에서 동작 |
 
 ## 디렉토리 구조
 

@@ -14,8 +14,8 @@ Codex, Slackbot, etc.).
 
 | Server | Path | Description |
 |---|---|---|
-| Management MCP | [`servers/management`](servers/management) | MCP server built on the GitHub Knowledge adapter (`mcp` SDK + Starlette). Live at `https://mcp.devoks.kr/mcp` |
-| Slackbot | [`servers/slackbot`](servers/slackbot) | Bridge between the Slack Events API and the Claude API MCP connector. Deployed as two AWS Lambdas (handler/worker), running in a Slack workspace |
+| Management MCP | [`servers/management`](servers/management) | The knowledge gateway (`devoks-management-mcp`) that agent clients connect to directly — owns the Knowledge/Runtime/Business adapters and the Auth/RBAC/Audit skeleton. MCP server built on the GitHub Knowledge adapter (`mcp` SDK + Starlette). Live at `https://mcp.devoks.kr/mcp` |
+| Slackbot | [`servers/slackbot`](servers/slackbot) | A channel, not a knowledge source of its own — authenticates a Slack user and relays their question to Management MCP. Bridges the Slack Events API and the Claude API MCP connector. Deployed as two AWS Lambdas (handler/worker), running in a Slack workspace |
 
 ## Directory Structure
 
