@@ -193,6 +193,7 @@ Management MCP는 `mcp.devoks.kr`에서, Slackbot은 handler/worker Lambda 2개�
 - [`../.claude/rules/project-convention.md`](../.claude/rules/project-convention.md) — 코딩 규범 SSOT
 - [WORKFLOW.md](WORKFLOW.md) — 전체 작업 흐름(왜 이 순서, 무엇이 실측으로 뒤집혔는지)
 - [roadmap.md](roadmap.md) — 확장 예정 스펙(GitHub 쓰기 권한 등 아직 FRD로 확정되지 않은 아이디어)
+- [build-vs-buy-agent-platform.md](build-vs-buy-agent-platform.md) — Claude Tag 등 완전형 에이전트 솔루션과의 비교, 솔루션 사용 vs 직접 구현 의사결정 참고자료
 - [`../.claude/workspace/management-mcp-bootstrap-20260903/FRD.md`](../.claude/workspace/management-mcp-bootstrap-20260903/FRD.md) / `PLAN.md` — Management 요구사항·설계·작업 분해
 - [`../.claude/workspace/slackbot-integration-20260914/FRD.md`](../.claude/workspace/slackbot-integration-20260914/FRD.md) / `PLAN.md` — Slackbot 요구사항·설계·작업 분해
 

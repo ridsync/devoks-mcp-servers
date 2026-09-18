@@ -196,6 +196,7 @@ Management MCP runs live at `mcp.devoks.kr`, and Slackbot runs live as two Lambd
 - [`.claude/rules/project-convention.md`](.claude/rules/project-convention.md) — Coding convention SSOT
 - [docs/WORKFLOW.md](docs/WORKFLOW.md) — The overall workflow (why this order, what turned out differently in practice)
 - [docs/roadmap.md](docs/roadmap.md) — Planned expansion specs (ideas not yet finalized as an FRD, such as GitHub write access)
+- [docs/build-vs-buy-agent-platform.md](docs/build-vs-buy-agent-platform.md) — Comparison against turnkey agent solutions like Claude Tag, as a reference for build-vs-buy architecture decisions
 - [`.claude/workspace/management-mcp-bootstrap-20260903/FRD.md`](.claude/workspace/management-mcp-bootstrap-20260903/FRD.md) / `PLAN.md` — Management requirements, design, task breakdown
 - [`.claude/workspace/slackbot-integration-20260914/FRD.md`](.claude/workspace/slackbot-integration-20260914/FRD.md) / `PLAN.md` — Slackbot requirements, design, task breakdown
 
